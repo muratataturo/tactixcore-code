@@ -3,12 +3,15 @@ const poses = {
   thinking: ['think', 'think', 'idle'],
   answering: ['dribble', 'dribble', 'kick', 'dribble'],
   working: ['dribble', 'kick', 'dribble'],
+  searching: ['think', 'dribble', 'dribble'],
+  fetching: ['think', 'idle', 'think'],
   compacting: ['think', 'idle', 'think'],
   done: ['kick', 'celebrate', 'celebrate', 'idle'],
   paused: ['concern', 'concern', 'idle']
 };
 const labels = {
   idle: 'Ready', thinking: 'Thinking', answering: 'Writing response', working: 'Running tools',
+  searching: 'Searching the Web', fetching: 'Reading a Web page',
   compacting: 'Compacting context', done: 'Completed', paused: 'Paused'
 };
 

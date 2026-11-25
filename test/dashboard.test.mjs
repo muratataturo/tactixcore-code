@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { resetCapabilitiesCache, setCapabilities, visibleWidth } from '@earendil-works/pi-tui';
-import { renderDashboardHeader, renderDashboardFooter, renderWorkingMascot, usageDetails } from '../src/dashboard.mjs';
+import { mascotPreview, renderDashboardHeader, renderDashboardFooter, renderWorkingMascot, usageDetails } from '../src/dashboard.mjs';
 import { createMascotImage } from '../src/pomeranian-logo.mjs';
 import { createUsageLedger, formatCount, formatUsd } from '../src/usage.mjs';
 import { mascotMotion } from '../src/mascot-motion.mjs';
@@ -36,13 +36,13 @@ test('usage ledger sums provider figures and marks unreported values', () => {
   assert.match(usageDetails(totals, 'openrouter/auto').join('\n'), /100\+ included in input/);
 });
 
-test('thumbnail header and usage stay within normal and narrow terminal widths', () => {
+test('the chat header and usage fit normal and narrow terminals without drawing images', () => {
   const state = createUsageLedger().snapshot();
   for (const width of [24, 40, 66, 80, 120]) {
-    const header = renderDashboardHeader(width, 35, theme);
+    const header = renderDashboardHeader(width, theme);
     assert.ok(header.some(line => line.includes('TactixCore Code')));
     assert.ok(header.every(line => visibleWidth(line) <= width));
-    if (width >= 40) assert.ok(header.some(line => line.includes('▀')));
+    assert.ok(header.every(line => !line.includes('▀') && !line.includes('\x1b_G')));
     const footer = renderDashboardFooter(width, theme, {
       state, model: 'openrouter/auto', workspace: 'tactixcore-code', branch: 'feature/dashboard',
       context: { percent: 32.2 }
@@ -51,7 +51,6 @@ test('thumbnail header and usage stay within normal and narrow terminal widths',
     assert.match(footer.join('\n'), /Tokens 0 in \/ 0 out/);
     assert.match(footer.join('\n'), /Session \$0\.00/);
   }
-  assert.ok(renderDashboardHeader(80, 19, theme).every(line => !line.includes('▀')));
 });
 
 test('image-capable terminals receive the PNG through their native protocol', t => {
@@ -59,7 +58,7 @@ test('image-capable terminals receive the PNG through their native protocol', t 
   for (const [protocol, prefix] of [['kitty', '\x1b_G'], ['iterm2', '\x1b]1337;File=']]) {
     setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
     const image = createMascotImage(theme, 12);
-    const lines = renderDashboardHeader(80, 35, theme, image);
+    const lines = image.render(80);
     assert.ok(lines.some(line => line.includes(prefix)));
     assert.ok(lines.every(line => !line.includes('▀')));
   }
@@ -83,18 +82,18 @@ test('distinct illustrated poses follow agent activity and settle back to idle',
   assert.deepEqual(motion.pose(), { frame: 'idle', label: 'Ready', visible: false });
 });
 
-test('the active mascot uses the native image canvas at a readable size', t => {
+test('the activity marker reserves one text line and preview graphics are explicitly deleted', t => {
   t.after(() => resetCapabilitiesCache());
   setCapabilities({ images: 'kitty', trueColor: true, hyperlinks: true });
-  const panel = {
-    render(width, rows, frame) {
-      assert.equal(rows, 21);
-      assert.equal(frame, 'kick');
-      return createMascotImage(theme, rows, frame).render(width);
-    }
-  };
-  const lines = renderWorkingMascot(110, 35, theme, { visible: true, label: 'Running tools', frame: 'kick' }, panel);
-  assert.equal(lines[0], 'Running tools');
-  assert.ok(lines.some(line => line.includes('\x1b_G')));
-  assert.ok(renderMascotThumbnail(110, 'truecolor', 'kick', 21).length >= 20);
+  const lines = renderWorkingMascot(110, theme, { visible: true, label: 'Searching the Web', frame: 'think' });
+  assert.deepEqual(lines, ['🐶 Luke · Searching the Web']);
+  const writes = [];
+  const preview = mascotPreview({ terminal: { write: value => writes.push(value) } }, theme);
+  assert.ok(preview.render(110, 24, 'kick').some(line => line.includes('\x1b_G')));
+  assert.ok(preview.render(110, 24, 'celebrate').some(line => line.includes('\x1b_G')));
+  assert.equal(writes.length, 1);
+  assert.match(writes[0], /a=d,d=I/);
+  preview.dispose();
+  assert.equal(writes.length, 2);
+  assert.match(writes[1], /a=d,d=I/);
 });

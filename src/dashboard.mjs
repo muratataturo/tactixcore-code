@@ -1,5 +1,5 @@
 import { basename } from 'node:path';
-import { getCapabilities, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { deleteKittyImage, getCapabilities, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import { createMascotImage, mascotFrames, renderMascotThumbnail } from './pomeranian-logo.mjs';
 import { formatCount, formatUsd } from './usage.mjs';
 import { mascotMotion } from './mascot-motion.mjs';
@@ -26,43 +26,41 @@ function rows(items, width) {
   return fit(lines, width);
 }
 
-export function renderDashboardHeader(width, height, theme, image) {
-  const title = theme.fg('accent', theme.bold('TactixCore Code'));
+export function renderDashboardHeader(width, theme) {
+  const title = theme.fg('accent', theme.bold('🐾 TactixCore Code'));
   const context = theme.fg('muted', 'Pi  /  OpenRouter');
   const shortcuts = theme.fg('dim', '/mascot   /usage   /skill:   Ctrl+D');
-  if (width < 40 || height < 22) return fit([title, shortcuts], width);
-  if (image) return [...fit([title + '  ' + context, shortcuts], width), ...image.render(width), ''];
-  const art = renderMascotThumbnail(width, undefined, 'idle', Math.min(21, height - 13));
-  if (width < 76) return [...art, ...fit([title + '  ' + context, shortcuts], width), ''];
-  const labels = new Map([[2, title], [3, context], [6, shortcuts]]);
-  return [...art.map((line, index) => truncateToWidth(line + '    ' + (labels.get(index) ?? ''), width)), ''];
+  return [...rows([title, context], width), ...fit([shortcuts], width)];
 }
 
-function mascotPanel(theme) {
-  const images = new Map();
-  let rows;
+export function mascotPreview(tui, theme) {
+  let image;
+  let current;
+  const dispose = () => {
+    const id = image?.getImageId();
+    if (id !== undefined) tui.terminal.write(deleteKittyImage(id));
+    image = undefined;
+    current = undefined;
+  };
   return {
     render(width, height, frame) {
-      if (rows !== height) {
-        rows = height;
-        images.clear();
+      const key = `${width}/${height}/${frame}`;
+      if (current !== key) {
+        dispose();
+        current = key;
+        if (getCapabilities().images === 'kitty') image = createMascotImage(theme, height, frame);
       }
-      if (getCapabilities().images) {
-        if (!images.has(frame)) images.set(frame, createMascotImage(theme, height, frame));
-        return images.get(frame).render(width);
-      }
-      return renderMascotThumbnail(width, undefined, frame, height);
+      return image?.render(width) ?? renderMascotThumbnail(width, undefined, frame, height);
     },
-    invalidate() { for (const image of images.values()) image.invalidate(); }
+    invalidate() { image?.invalidate(); },
+    dispose
   };
 }
 
-export function renderWorkingMascot(width, terminalRows, theme, pose, panel) {
+export function renderWorkingMascot(width, theme, pose) {
   if (!pose.visible) return [];
-  const label = theme.fg('accent', pose.label);
-  if (width < 32 || terminalRows < 20) return fit([label], width);
-  const height = Math.min(21, terminalRows - 14);
-  return [...fit([label], width), ...panel.render(width, height, pose.frame)];
+  const icons = { idle: '🐾', think: '🐶', dribble: '🐾', kick: '⚽', celebrate: '✨', concern: '🐶' };
+  return fit([theme.fg('accent', `${icons[pose.frame]} Luke · ${pose.label}`)], width);
 }
 
 function counts(state) {
@@ -111,14 +109,19 @@ export function usageDetails(state, configuredModel) {
 export function dashboardExtension(ledger, activeWorkers = () => 0) {
   return pi => {
     const motion = mascotMotion();
-    const tools = new Set();
+    const tools = new Map();
     let running = false;
     let failed = false;
-    let started = false;
     const reduced = process.env.TACTIXCORE_REDUCED_MOTION === '1';
+    const updateToolActivity = () => {
+      const names = [...tools.values()];
+      if (names.includes('web_search')) motion.change('searching');
+      else if (names.includes('web_fetch')) motion.change('fetching');
+      else if (names.length) motion.change('working');
+      else motion.change(running ? 'thinking' : 'done');
+    };
     pi.on('agent_start', () => {
       running = true;
-      started = true;
       failed = false;
       tools.clear();
       motion.change('thinking');
@@ -127,20 +130,17 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
       if (running && !tools.size && event.assistantMessageEvent.type === 'text_delta') motion.change('answering');
     });
     pi.on('tool_execution_start', event => {
-      tools.add(event.toolCallId);
-      motion.change('working');
+      tools.set(event.toolCallId, event.toolName);
+      updateToolActivity();
     });
     pi.on('tool_execution_end', event => {
       tools.delete(event.toolCallId);
-      if (!tools.size) motion.change(running ? 'thinking' : 'done');
+      updateToolActivity();
     });
     pi.on('message_end', event => {
       if (event.message.role === 'assistant') failed = ['error', 'length', 'aborted'].includes(event.message.stopReason);
     });
-    pi.on('session_before_compact', () => {
-      started = true;
-      motion.change('compacting');
-    });
+    pi.on('session_before_compact', () => motion.change('compacting'));
     pi.on('session_compact', () => motion.change(running ? 'thinking' : 'done'));
     pi.on('session_compact_failed', () => motion.change(running ? 'thinking' : 'paused'));
     pi.on('agent_settled', event => {
@@ -150,21 +150,11 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
     });
     pi.on('session_start', (_event, ctx) => {
       if (!ctx.hasUI) return;
-      ctx.ui.setHeader((tui, theme) => {
-        const panel = mascotPanel(theme);
-        return {
-          render(width) {
-            const height = tui.terminal.rows;
-            if (started) return fit([theme.fg('accent', theme.bold('TactixCore Code'))], width);
-            return renderDashboardHeader(width, height, theme, getCapabilities().images ? {
-              render: columns => panel.render(columns, Math.min(21, height - 13), 'idle')
-            } : undefined);
-          },
-          invalidate: panel.invalidate
-        };
-      });
+      ctx.ui.setHeader((_tui, theme) => ({
+        render: width => renderDashboardHeader(width, theme),
+        invalidate() {}
+      }));
       ctx.ui.setWidget('tactixcore-mascot', (tui, theme) => {
-        const panel = mascotPanel(theme);
         let timer;
         const redraw = () => {
           tui.requestRender();
@@ -181,9 +171,9 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
         const removeMotion = motion.subscribe(redraw);
         return {
           render(width) {
-            return renderWorkingMascot(width, tui.terminal.rows, theme, motion.pose(activeWorkers(), reduced), panel);
+            return renderWorkingMascot(width, theme, motion.pose(activeWorkers(), reduced));
           },
-          invalidate: panel.invalidate,
+          invalidate() {},
           dispose() { removeMotion(); clearInterval(timer); }
         };
       });
@@ -207,7 +197,7 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
         if (!ctx.hasUI) return;
         await ctx.ui.custom((tui, theme, _keys, done) => {
           let index = 0;
-          const panel = mascotPanel(theme);
+          const panel = mascotPreview(tui, theme);
           return {
             render(width) {
               const names = ['Idle', 'Thinking', 'Dribbling', 'Kick', 'Celebrating', 'Concerned'];
@@ -216,6 +206,7 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
                 ...panel.render(width, Math.max(4, Math.min(26, tui.terminal.rows - 9)), mascotFrames[index])];
             },
             invalidate: panel.invalidate,
+            dispose: panel.dispose,
             handleInput(data) {
               if (matchesKey(data, 'escape') || matchesKey(data, 'enter')) return done(undefined);
               if (matchesKey(data, 'left')) index = (index + 5) % 6;
