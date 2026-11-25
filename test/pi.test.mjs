@@ -48,6 +48,7 @@ test('Pi streams a routed answer and exports only approved OTLP attributes', asy
   assert.equal(payload.model, 'openrouter/auto');
   assert.deepEqual(payload.plugins[0].allowed_models, ['openai/gpt-5-nano', 'openai/gpt-5-mini']);
   assert.deepEqual(payload.usage, { include: true });
+  assert.equal(payload.max_tokens ?? payload.max_completion_tokens, 16384);
   assert.equal(payload.provider.data_collection, 'deny');
   assert.equal(payload.tools, undefined);
   assert.equal(headers.get('Authorization'), `Bearer ${fixtureKey}`);

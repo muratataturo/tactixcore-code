@@ -12,6 +12,7 @@ const provider = 'tactixcore-openrouter';
 const origin = 'https://openrouter.ai/api/v1';
 const routingPolicyVersion = '1';
 export const contextWindow = 96_000;
+export const defaultOutputTokens = 16_384;
 const routes = {
   triage: { tier: 'low', models: ['openai/gpt-5-nano', 'openai/gpt-5-mini'] },
   synthesis: { tier: 'medium', models: ['openai/gpt-5-mini', 'openai/gpt-5.4-mini'] }
@@ -172,7 +173,7 @@ export async function createOpenRouterRuntime(route, stream, maxTokens = 512) {
 export async function runPi({
   key, prompt, model, stage, skill, endpoint, out, err,
   analysis, env = process.env, analysisStart, fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch,
-  maxTokens = analysis ? 512 : 4096
+  maxTokens = defaultOutputTokens
 }) {
   const route = resolveRoute(model, stage);
   const guidance = skill ? readBundledSkill(skill) : null;

@@ -2,6 +2,7 @@ import { basename } from 'node:path';
 import { getCapabilities, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import { createMascotImage, renderMascotThumbnail } from './pomeranian-logo.mjs';
 import { formatCount, formatUsd } from './usage.mjs';
+import { mascotMotion } from './mascot-motion.mjs';
 
 const dot = '  ·  ';
 const text = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
@@ -31,7 +32,7 @@ export function renderDashboardHeader(width, height, theme, image) {
   const shortcuts = theme.fg('dim', '/usage   /skill:   Ctrl+D');
   if (width < 40 || height < 22) return fit([title, shortcuts], width);
   if (image) return [...fit([title + '  ' + context, shortcuts], width), ...image.render(width), ''];
-  const art = renderMascotThumbnail(height < 28 ? 28 : Math.min(44, width));
+  const art = renderMascotThumbnail(height < 28 ? 24 : Math.min(30, width));
   if (width < 76) return [...art, ...fit([title + '  ' + context, shortcuts], width), ''];
   const labels = new Map([[2, title], [3, context], [6, shortcuts]]);
   return [...art.map((line, index) => truncateToWidth(line + '    ' + (labels.get(index) ?? ''), width)), ''];
@@ -80,8 +81,41 @@ export function usageDetails(state, configuredModel) {
   return rows;
 }
 
-export function dashboardExtension(ledger) {
+export function dashboardExtension(ledger, activeWorkers = () => 0) {
   return pi => {
+    const motion = mascotMotion();
+    const tools = new Set();
+    let running = false;
+    let failed = false;
+    const reduced = process.env.TACTIXCORE_REDUCED_MOTION === '1';
+    pi.on('agent_start', () => {
+      running = true;
+      failed = false;
+      tools.clear();
+      motion.change('thinking');
+    });
+    pi.on('message_update', event => {
+      if (running && !tools.size && event.assistantMessageEvent.type === 'text_delta') motion.change('answering');
+    });
+    pi.on('tool_execution_start', event => {
+      tools.add(event.toolCallId);
+      motion.change('working');
+    });
+    pi.on('tool_execution_end', event => {
+      tools.delete(event.toolCallId);
+      if (!tools.size) motion.change(running ? 'thinking' : 'done');
+    });
+    pi.on('message_end', event => {
+      if (event.message.role === 'assistant') failed = ['error', 'length', 'aborted'].includes(event.message.stopReason);
+    });
+    pi.on('session_before_compact', () => motion.change('compacting'));
+    pi.on('session_compact', () => motion.change(running ? 'thinking' : 'done'));
+    pi.on('session_compact_failed', () => motion.change(running ? 'thinking' : 'paused'));
+    pi.on('agent_settled', event => {
+      running = false;
+      tools.clear();
+      motion.change(event.aborted || failed ? 'paused' : 'done');
+    });
     pi.on('session_start', (_event, ctx) => {
       if (!ctx.hasUI) return;
       ctx.ui.setHeader((tui, theme) => {
@@ -99,6 +133,35 @@ export function dashboardExtension(ledger) {
             return renderDashboardHeader(width, height, theme, image);
           },
           invalidate() { compact?.invalidate(); full?.invalidate(); }
+        };
+      });
+      ctx.ui.setWidget('tactixcore-mascot', (tui, theme) => {
+        let timer;
+        const redraw = () => {
+          tui.requestRender();
+          if (motion.pose().visible && !timer) {
+            timer = setInterval(() => {
+              tui.requestRender();
+              if (!motion.pose().visible) {
+                clearInterval(timer);
+                timer = undefined;
+              }
+            }, 430).unref();
+          }
+        };
+        const removeMotion = motion.subscribe(redraw);
+        return {
+          render(width) {
+            const pose = motion.pose(activeWorkers(), reduced);
+            if (!pose.visible) return [];
+            const label = theme.fg('accent', pose.label);
+            if (width < 38 || tui.terminal.rows < 24) return [truncateToWidth(label, width)];
+            const sprite = renderMascotThumbnail(tui.terminal.rows >= 32 ? 16 : 10, undefined, pose.frame);
+            const center = Math.floor(sprite.length / 2);
+            return sprite.map((line, row) => truncateToWidth(line + (row === center ? '   ' + label : ''), width));
+          },
+          invalidate() {},
+          dispose() { removeMotion(); clearInterval(timer); }
         };
       });
       ctx.ui.setFooter((tui, theme, data) => {

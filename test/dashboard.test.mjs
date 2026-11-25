@@ -4,6 +4,8 @@ import { resetCapabilitiesCache, setCapabilities, visibleWidth } from '@earendil
 import { renderDashboardHeader, renderDashboardFooter, usageDetails } from '../src/dashboard.mjs';
 import { createMascotImage } from '../src/pomeranian-logo.mjs';
 import { createUsageLedger, formatCount, formatUsd } from '../src/usage.mjs';
+import { mascotMotion } from '../src/mascot-motion.mjs';
+import { renderMascotThumbnail } from '../src/pomeranian-logo.mjs';
 
 const theme = { fg: (_color, value) => value, bold: value => value };
 
@@ -61,4 +63,22 @@ test('image-capable terminals receive the PNG through their native protocol', t 
     assert.ok(lines.some(line => line.includes(prefix)));
     assert.ok(lines.every(line => !line.includes('▀')));
   }
+});
+
+test('distinct illustrated poses follow agent activity and settle back to idle', () => {
+  let now = 0;
+  const motion = mascotMotion(() => now);
+  motion.change('thinking');
+  assert.equal(motion.pose().frame, 'think');
+  motion.change('working');
+  assert.match(motion.pose(3).label, /3/);
+  assert.equal(motion.pose().frame, 'dribble');
+  now += 430;
+  assert.equal(motion.pose().frame, 'kick');
+  assert.notDeepEqual(renderMascotThumbnail(16, 'truecolor', 'kick'),
+    renderMascotThumbnail(16, 'truecolor', 'dribble'));
+  motion.change('done');
+  assert.equal(motion.pose(0, true).frame, 'celebrate');
+  now += 2700;
+  assert.deepEqual(motion.pose(), { frame: 'idle', label: 'Ready', visible: false });
 });

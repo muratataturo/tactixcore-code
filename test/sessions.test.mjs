@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { createUsageLedger } from '../src/usage.mjs';
-import { readSessionDiagnostics, runSessionsCommand, sessionRecorder } from '../src/sessions.mjs';
+import { readSessionDiagnostics, resumeCommand, resumeSession, runSessionsCommand, sessionRecorder } from '../src/sessions.mjs';
 
 test('native transcripts and allowlisted diagnostics can be located and inspected offline', async t => {
   const profile = mkdtempSync(join(tmpdir(), 'tactixcore-sessions-'));
@@ -31,6 +31,12 @@ test('native transcripts and allowlisted diagnostics can be located and inspecte
     compactionEntry: { tokensBefore: 500, summary: 'Private summary fixture' } });
   const out = [];
   const id = manager.getSessionId();
+  assert.equal(resumeCommand(manager, { maxTokens: 16384, parallel: true }), `tactixcore-code --resume ${id}`);
+  assert.equal(resumeCommand(manager, { maxTokens: 24576, model: 'openai/gpt-5-mini', parallel: false }),
+    `tactixcore-code --resume ${id} --model openai/gpt-5-mini --max-output-tokens 24576 --no-parallel`);
+  assert.equal((await resumeSession(profile, id)).getSessionFile(), realpathSync(manager.getSessionFile()));
+  assert.equal((await resumeSession(profile, id)).getEntries()[0].message.content, 'Private transcript fixture');
+  await assert.rejects(resumeSession(profile, '../auth.json'));
   assert.equal(await runSessionsCommand(['inspect', id], { profile, out: value => out.push(value), err: assert.fail }), 0);
   assert.doesNotMatch(out[0], /Private transcript|Private summary|Provider body/);
   const inspected = JSON.parse(out[0]);

@@ -3,7 +3,7 @@ import { parseArgs, parseEnv } from 'node:util';
 import { profileDirectory, saveEnvFile, selectEnvFile } from './profile.mjs';
 
 const help = `Usage
-  tactixcore-code [--env-file PATH] [--model MODEL] [--max-output-tokens N] [--no-session]
+  tactixcore-code [--resume SESSION_ID] [--env-file PATH] [--model MODEL] [--max-output-tokens N] [--no-session] [--no-parallel]
   tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
@@ -86,6 +86,7 @@ export async function main(args, {
           prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' }, skill: { type: 'string' },
           'otlp-endpoint': { type: 'string' }, 'analysis-input': { type: 'string' },
           'max-output-tokens': { type: 'string' }, 'no-session': { type: 'boolean' },
+          resume: { type: 'string' }, 'no-parallel': { type: 'boolean' },
           playground: { type: 'string' }, team: { type: 'string' }, game: { type: 'string' },
           opponent: { type: 'string' }, player: { type: 'string' }
         } : {}),
@@ -102,6 +103,10 @@ export async function main(args, {
     return 0;
   }
   const interactive = command === 'pi' && values.prompt === undefined;
+  if (values.resume !== undefined && (!interactive || values['no-session'])) {
+    err('--resume requires interactive mode with session storage enabled.');
+    return 2;
+  }
   const outputBudget = values['max-output-tokens'];
   const maxTokens = outputBudget === undefined ? undefined : Number(outputBudget);
   if (outputBudget !== undefined && (!/^\d+$/.test(outputBudget) || maxTokens < 1024 || maxTokens > 24576)) {
@@ -160,11 +165,13 @@ export async function main(args, {
         await openInteractivePi({
           key, envFile, model: values.model, stage: values.stage, skill: values.skill,
           endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-          profile: profileDirectory(env), maxTokens, persist: !values['no-session']
+          profile: profileDirectory(env), maxTokens, persist: !values['no-session'],
+          resume: values.resume, parallel: !values['no-parallel']
         });
         return 0;
       } catch {
-        err('Pi could not start. Check the terminal, workspace, and configured model.');
+        err(values.resume === undefined ? 'Pi could not start. Check the terminal, workspace, and configured model.'
+          : 'Could not resume. Verify the session ID with tactixcore-code sessions list.');
         return 1;
       }
     }

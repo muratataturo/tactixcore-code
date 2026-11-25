@@ -34,11 +34,11 @@ Pi の画面で普通に入力すると、同じ会話のまま続けられま�
 
 フッターにはこのセッションの入力・出力トークン、OpenRouter が返した累計費用（USD）、コンテキスト使用率、実際のモデルを表示します。`/usage` でリクエスト件数、キャッシュ・推論トークンの内訳を確認できます。値の末尾の `+` は一部未取得、`—` は取得できた値がないことを表します。費用には、この Pi セッション内で実行された OpenRouter リクエストを集計します。
 
-起動画面のポメラニアンは、Kitty 画像プロトコルに対応した端末や iTerm2 では PNG で表示します。iTerm2 では PNG 表示に対応する Pi の通常画面モードで起動します。画像プロトコルのない端末では、同じイラストを端末の文字セルに合わせたサムネイルで表示します。
+起動画面のポメラニアンは、Kitty 画像プロトコルに対応した端末や iTerm2 では PNG で表示します。iTerm2 では PNG 表示に対応する Pi の通常画面モードで起動します。入力欄の近くでは、思考中・応答中・ツール実行中・圧縮中・完了時にポーズが変わります。`TACTIXCORE_REDUCED_MOTION=1 tactixcore-code` では状態ごとに静止画を表示します。
 
 ## 長い対話とセッションの調査
 
-対話モードの出力上限は1リクエストあたり12,288トークンです。必要に応じて `tactixcore-code --max-output-tokens 16384` で調整できます。コンテキストが上限に近づくと、Pi が古い会話を要約し、最近の会話を残します。`/compact` で手動圧縮を実行できます。圧縮はモデルを1回以上呼び出すことがあります。
+対話モードとワンショットの出力上限は1リクエストあたり16,384トークンです。必要に応じて `tactixcore-code --max-output-tokens 24576` で調整できます。コンテキストが上限に近づくと、Pi が古い会話を要約し、最近の会話を残します。`/compact` で手動圧縮を実行できます。圧縮はモデルを1回以上呼び出すことがあります。
 
 OpenRouter には対話ごとの識別子を渡し、対応プロバイダーの短期キャッシュを再利用しやすくしています。キャッシュが命中した場合は `/usage` の Cache read に反映されます。
 
@@ -46,11 +46,18 @@ OpenRouter には対話ごとの識別子を渡し、対応プロバイダーの
 tactixcore-code sessions list
 tactixcore-code sessions inspect SESSION_ID
 tactixcore-code sessions path SESSION_ID
+tactixcore-code --resume SESSION_ID
 ```
 
 対話は Pi の JSONL 形式で `~/.config/tactixcore-code/agent/sessions/` に保存します。環境変数 `XDG_CONFIG_HOME` を設定した場合はその配下を使います。JSONL には依頼、応答、ツール結果が含まれます。記録しない対話は `tactixcore-code --no-session` で起動します。Pi の `/resume` で保存済みの対話を再開できます。
 
+保存済みの対話を終了すると、最後に `tactixcore-code --resume SESSION_ID` を表示します。元の作業ディレクトリと会話に戻り、保存された OpenRouter の使用量も復元します。
+
 `sessions inspect` は本文を出さず、モデル、終了理由、トークン、OpenRouter が返した費用、圧縮結果、トレース ID を JSON で返します。分析用ログは同じ設定ディレクトリの `diagnostics/` に保存します。OpenRouter の費用を確認する場合はこのログを参照してください。
+
+## 並列調査
+
+Pi が、互いの結果に依存しない複数の調査を並列化できると判断した場合、`parallel_research` を使います。1ターンに1バッチ、2〜3個のサブエージェントが現在のワークスペースを読み取り専用で調べます。親の Pi が結果を統合し、必要な編集を行います。サブエージェントの推論もセッションの使用量とトレースに含まれます。並列機能をオフにするには `tactixcore-code --no-parallel` で起動します。
 
 設定ファイルに保存するのは dotenv のパスです。OpenRouter キーは起動のたびに元ファイルから読みます。1回だけ別の設定を使う場合は `tactixcore-code --env-file PATH` を使えます。
 
