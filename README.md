@@ -11,7 +11,15 @@ npm ci --ignore-scripts
 node bin/tactixcore-code.mjs --help
 ```
 
-ソースからグローバルコマンドを導入する場合は `npm install --global --ignore-scripts --install-links .` を使えます。以下の例では、このコマンド名を使用します。
+どのディレクトリからでも `tactixcore-code` で起動するには、同じリポジトリのルートで次を実行します。
+
+```sh
+npm install --global --ignore-scripts --install-links .
+command -v tactixcore-code
+tactixcore-code skills list
+```
+
+インストール後に zsh でコマンドが見つからない場合は、`rehash` を実行してから再確認します。まだ見つからない場合は、`npm prefix --global` が返すディレクトリの `bin` が PATH に含まれているか確認してください。
 
 ## OpenRouter と Pi
 
