@@ -4,6 +4,7 @@ import {
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
 import { Trace } from './telemetry.mjs';
+import { readBundledSkill } from './analysis-cli.mjs';
 
 const provider = 'tactixcore-openrouter';
 const origin = 'https://openrouter.ai/api/v1';
@@ -79,13 +80,19 @@ function openRouterStream({ trace, parent, route, key, fetchModel }) {
         }
       });
       void stream.result().then(message => {
+        const attempts = Array.isArray(metadata?.attempts) ? metadata.attempts.length : undefined;
+        const position = Number.isSafeInteger(metadata?.attempt) ? metadata.attempt : undefined;
+        const routingStrategy = ['direct', 'auto', 'free', 'latest', 'alias', 'fallback', 'pareto', 'bodybuilder', 'fusion']
+          .includes(metadata?.strategy) ? metadata.strategy : undefined;
         span.end({
           'gen_ai.response.model': actualModel,
           'gen_ai.usage.input_tokens': usage?.prompt_tokens,
           'gen_ai.usage.output_tokens': usage?.completion_tokens,
           'tactixcore.cost.usd': usage?.cost,
           'tactixcore.routing.metadata_observed': Boolean(metadata),
-          'tactixcore.routing.provider_attempts': Array.isArray(metadata?.attempts) ? metadata.attempts.length : undefined,
+          'tactixcore.routing.provider_attempts': attempts ?? position,
+          'tactixcore.routing.strategy': routingStrategy,
+          'tactixcore.routing.used_fallback': position === undefined ? undefined : position > 1,
           'http.response.status_code': httpStatus
         }, policyError ? 'model_outside_policy' : ['error', 'aborted'].includes(message.stopReason)
           ? (httpStatus >= 400 ? String(httpStatus) : message.stopReason) : undefined);
@@ -99,13 +106,17 @@ function openRouterStream({ trace, parent, route, key, fetchModel }) {
 }
 
 export async function runPi({
-  key, prompt, model, stage, endpoint, out, err,
+  key, prompt, model, stage, skill, endpoint, out, err,
   fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch
 }) {
   const route = resolveRoute(model, stage);
+  const guidance = skill ? readBundledSkill(skill) : null;
   const trace = new Trace(endpoint, fetchTrace);
   const root = trace.start('invoke_agent tactixcore-code', {
-    fields: { 'gen_ai.operation.name': 'invoke_agent', 'gen_ai.agent.name': 'tactixcore-code' }
+    fields: {
+      'gen_ai.operation.name': 'invoke_agent', 'gen_ai.agent.name': 'tactixcore-code',
+      'tactixcore.skill.id': skill, 'tactixcore.skill.version': skill ? '1' : undefined
+    }
   });
   const cwd = import.meta.dirname;
   const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
@@ -129,7 +140,10 @@ export async function runPi({
     const resourceLoader = new DefaultResourceLoader({
       cwd, agentDir: cwd, settingsManager, noExtensions: true, noSkills: true,
       noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      systemPrompt: 'You are TactixCore. Help with soccer questions. Say when evidence is missing.'
+      systemPrompt: [
+        'You are TactixCore. Help with soccer questions. Say when evidence is missing.',
+        guidance
+      ].filter(Boolean).join('\n\n')
     });
     await resourceLoader.reload();
     ({ session } = await createAgentSession({

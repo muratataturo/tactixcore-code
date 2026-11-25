@@ -4,7 +4,12 @@ import { parseArgs, parseEnv } from 'node:util';
 const help = `Usage
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
-  tactixcore-code pi --prompt TEXT [--env-file PATH] [--model MODEL] [--otlp-endpoint URL]
+  tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
+  tactixcore-code skills list
+  tactixcore-code run SKILL --playground PATH --team ID --game ID --input FILE [--dry-run]
+  tactixcore-code web-search --query PUBLIC_QUERY [--env-file PATH]
+  tactixcore-code web-fetch --url PUBLIC_HTTPS_URL
+  tactixcore-code improve status | scan --playground PATH [--observations FILE]
 
 Use an external dotenv file or an existing OPENROUTER_API_KEY environment variable.
 doctor checks local configuration. check-openrouter queries key status only.`;
@@ -46,7 +51,15 @@ export async function main(args, {
     out(help);
     return 0;
   }
-  if (!['doctor', 'check-openrouter', 'pi'].includes(command)) {
+  if (command === 'skills' || command === 'run') {
+    const { runAnalysisCommand } = await import('./analysis-cli.mjs');
+    return runAnalysisCommand(command, flags, { env, out, err });
+  }
+  if (command === 'improve') {
+    const { runImproveCommand } = await import('./improve.mjs');
+    return runImproveCommand(flags, { env, out, err });
+  }
+  if (!['doctor', 'check-openrouter', 'pi', 'web-search', 'web-fetch'].includes(command)) {
     err(help);
     return 2;
   }
@@ -57,9 +70,11 @@ export async function main(args, {
       options: {
         'env-file': { type: 'string' }, help: { type: 'boolean' },
         ...(command === 'pi' ? {
-          prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' },
+          prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' }, skill: { type: 'string' },
           'otlp-endpoint': { type: 'string' }
-        } : {})
+        } : {}),
+        ...(command === 'web-search' ? { query: { type: 'string' } } : {}),
+        ...(command === 'web-fetch' ? { url: { type: 'string' } } : {})
       }
     }));
   } catch {
@@ -69,6 +84,15 @@ export async function main(args, {
   if (values.help) {
     out(help);
     return 0;
+  }
+  if (command === 'web-fetch') {
+    try {
+      const { runWeb } = await import('./web.mjs');
+      return await runWeb(command, values.url, { endpoint: env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, out, err });
+    } catch {
+      err('Could not retrieve the public HTTPS page.');
+      return 1;
+    }
   }
 
   let key;
@@ -90,12 +114,21 @@ export async function main(args, {
     try {
       const { runPi } = await import('./pi.mjs');
       return await runPi({
-        key, prompt: values.prompt, model: values.model, stage: values.stage,
+        key, prompt: values.prompt, model: values.model, stage: values.stage, skill: values.skill,
         endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
         out, err
       });
     } catch {
       err('Pi could not complete the request. Check the model, stage, and configured endpoint.');
+      return 1;
+    }
+  }
+  if (command === 'web-search') {
+    try {
+      const { runWeb } = await import('./web.mjs');
+      return await runWeb(command, values.query, { key, endpoint: env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, out, err });
+    } catch {
+      err('Public search failed. Check the query and OpenRouter connectivity.');
       return 1;
     }
   }
