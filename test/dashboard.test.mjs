@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { resetCapabilitiesCache, setCapabilities, visibleWidth } from '@earendil-works/pi-tui';
-import { renderDashboardHeader, renderDashboardFooter, usageDetails } from '../src/dashboard.mjs';
+import { renderDashboardHeader, renderDashboardFooter, renderWorkingMascot, usageDetails } from '../src/dashboard.mjs';
 import { createMascotImage } from '../src/pomeranian-logo.mjs';
 import { createUsageLedger, formatCount, formatUsd } from '../src/usage.mjs';
 import { mascotMotion } from '../src/mascot-motion.mjs';
@@ -81,4 +81,20 @@ test('distinct illustrated poses follow agent activity and settle back to idle',
   assert.equal(motion.pose(0, true).frame, 'celebrate');
   now += 2700;
   assert.deepEqual(motion.pose(), { frame: 'idle', label: 'Ready', visible: false });
+});
+
+test('the active mascot uses the native image canvas at a readable size', t => {
+  t.after(() => resetCapabilitiesCache());
+  setCapabilities({ images: 'kitty', trueColor: true, hyperlinks: true });
+  const panel = {
+    render(width, rows, frame) {
+      assert.equal(rows, 21);
+      assert.equal(frame, 'kick');
+      return createMascotImage(theme, rows, frame).render(width);
+    }
+  };
+  const lines = renderWorkingMascot(110, 35, theme, { visible: true, label: 'Running tools', frame: 'kick' }, panel);
+  assert.equal(lines[0], 'Running tools');
+  assert.ok(lines.some(line => line.includes('\x1b_G')));
+  assert.ok(renderMascotThumbnail(110, 'truecolor', 'kick', 21).length >= 20);
 });

@@ -4,7 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeAnalysis, planAnalysis } from '../src/analysis.mjs';
-import { fetchPublic, isPublicAddress, searchPublic } from '../src/web.mjs';
+import { createWebTools, fetchPublic, isPublicAddress, searchPublic } from '../src/web.mjs';
+import { Trace } from '../src/telemetry.mjs';
 import { runPi } from '../src/pi.mjs';
 
 function playground(t, skill, engine, family) {
@@ -190,4 +191,32 @@ test('web fetch rejects protected addresses including mixed public and private D
     { address: '93.184.216.34', family: 4 }, { address: '127.0.0.1', family: 4 }
   ]), /forbidden address/);
   await assert.rejects(fetchPublic('https://user:password@example.com'), /public HTTPS/);
+  await assert.rejects(fetchPublic('https://example.com/?access_token=secret'), /without access tokens/);
+});
+
+test('interactive Web tools share the agent trace and record paid search usage', async () => {
+  const trace = new Trace();
+  const parent = trace.start('agent');
+  const usage = [];
+  const [search, fetch] = createWebTools({
+    key: 'fixture', scope: () => ({ trace, parent }), recordUsage: record => usage.push(record),
+    search: async (query, key, options) => {
+      assert.equal(query, 'public fixtures');
+      assert.equal(key, 'fixture');
+      options.onRequest();
+      options.reportUsage({ prompt_tokens: 3, completion_tokens: 2, cost: 0.001 }, 'openai/gpt-5-nano');
+      return { results: [{ url: 'https://example.com/' }] };
+    },
+    fetchPage: async url => ({ url, excerpt: 'Public document' })
+  });
+  assert.equal(search.name, 'web_search');
+  assert.equal(fetch.name, 'web_fetch');
+  const found = await search.execute('search', { query: 'public fixtures' });
+  assert.match(found.content[0].text, /example\.com/);
+  const page = await fetch.execute('fetch', { url: 'https://example.com/' });
+  assert.match(page.content[0].text, /Public document/);
+  assert.equal(usage[0].source, 'web_search');
+  assert.equal(usage[0].usage.cost, 0.001);
+  assert.equal(trace.spans.find(span => span.name === 'execute_tool web-fetch').parentSpanId, parent.spanId);
+  assert.equal(trace.spans.find(span => span.name === 'execute_tool web-search').parentSpanId, parent.spanId);
 });

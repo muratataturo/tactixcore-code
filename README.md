@@ -34,7 +34,7 @@ Pi の画面で普通に入力すると、同じ会話のまま続けられま�
 
 フッターにはこのセッションの入力・出力トークン、OpenRouter が返した累計費用（USD）、コンテキスト使用率、実際のモデルを表示します。`/usage` でリクエスト件数、キャッシュ・推論トークンの内訳を確認できます。値の末尾の `+` は一部未取得、`—` は取得できた値がないことを表します。費用には、この Pi セッション内で実行された OpenRouter リクエストを集計します。
 
-起動画面のポメラニアンは、Kitty 画像プロトコルに対応した端末や iTerm2 では PNG で表示します。iTerm2 では PNG 表示に対応する Pi の通常画面モードで起動します。入力欄の近くでは、思考中・応答中・ツール実行中・圧縮中・完了時にポーズが変わります。`TACTIXCORE_REDUCED_MOTION=1 tactixcore-code` では状態ごとに静止画を表示します。
+起動画面と作業中のポメラニアンは、画像表示を有効にした Orca、Kitty 対応端末、iTerm2 では PNG で表示します。Orca と iTerm2 では Pi の通常画面モードで起動します。入力欄の近くでは、思考中・応答中・ツール実行中・圧縮中・完了時にポーズが変わります。`/mascot` を開くと、矢印キーまたは 1〜6 キーで全6ポーズを大きく確認できます。`TACTIXCORE_REDUCED_MOTION=1 tactixcore-code` では状態ごとに静止画を表示します。
 
 ## 長い対話とセッションの調査
 
@@ -102,6 +102,8 @@ tactixcore-code pi --env-file "$TACTIXCORE_PLAYGROUND/.env" --skill soccer-ownte
 `pi --analysis-input` では、チーム・試合・入力を検証した後に Pi へスコープ固定のツールを1つだけ渡します。ツールはその分析を1回実行できます。OpenRouter に返すのは成功・失敗の状態で、レポートと根拠はローカルに残ります。
 
 ## 公開情報の検索
+
+Pi の対話中は、例えば「JFAのU-18プレミアリーグ公式日程を検索して、公式ページを読んで」と依頼できます。Pi が `web_search` で出典候補を探し、`web_fetch` で公開ページの本文を確認します。検索に使った OpenRouter の使用量もセッションに記録します。
 
 ```sh
 tactixcore-code web-search --env-file ../tactixcore-playground/.env --query 'JFA U-18 プレミアリーグ 公式日程'

@@ -1,6 +1,6 @@
 import { basename } from 'node:path';
 import { getCapabilities, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
-import { createMascotImage, renderMascotThumbnail } from './pomeranian-logo.mjs';
+import { createMascotImage, mascotFrames, renderMascotThumbnail } from './pomeranian-logo.mjs';
 import { formatCount, formatUsd } from './usage.mjs';
 import { mascotMotion } from './mascot-motion.mjs';
 
@@ -29,13 +29,40 @@ function rows(items, width) {
 export function renderDashboardHeader(width, height, theme, image) {
   const title = theme.fg('accent', theme.bold('TactixCore Code'));
   const context = theme.fg('muted', 'Pi  /  OpenRouter');
-  const shortcuts = theme.fg('dim', '/usage   /skill:   Ctrl+D');
+  const shortcuts = theme.fg('dim', '/mascot   /usage   /skill:   Ctrl+D');
   if (width < 40 || height < 22) return fit([title, shortcuts], width);
   if (image) return [...fit([title + '  ' + context, shortcuts], width), ...image.render(width), ''];
-  const art = renderMascotThumbnail(height < 28 ? 24 : Math.min(30, width));
+  const art = renderMascotThumbnail(width, undefined, 'idle', Math.min(21, height - 13));
   if (width < 76) return [...art, ...fit([title + '  ' + context, shortcuts], width), ''];
   const labels = new Map([[2, title], [3, context], [6, shortcuts]]);
   return [...art.map((line, index) => truncateToWidth(line + '    ' + (labels.get(index) ?? ''), width)), ''];
+}
+
+function mascotPanel(theme) {
+  const images = new Map();
+  let rows;
+  return {
+    render(width, height, frame) {
+      if (rows !== height) {
+        rows = height;
+        images.clear();
+      }
+      if (getCapabilities().images) {
+        if (!images.has(frame)) images.set(frame, createMascotImage(theme, height, frame));
+        return images.get(frame).render(width);
+      }
+      return renderMascotThumbnail(width, undefined, frame, height);
+    },
+    invalidate() { for (const image of images.values()) image.invalidate(); }
+  };
+}
+
+export function renderWorkingMascot(width, terminalRows, theme, pose, panel) {
+  if (!pose.visible) return [];
+  const label = theme.fg('accent', pose.label);
+  if (width < 32 || terminalRows < 20) return fit([label], width);
+  const height = Math.min(21, terminalRows - 14);
+  return [...fit([label], width), ...panel.render(width, height, pose.frame)];
 }
 
 function counts(state) {
@@ -87,9 +114,11 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
     const tools = new Set();
     let running = false;
     let failed = false;
+    let started = false;
     const reduced = process.env.TACTIXCORE_REDUCED_MOTION === '1';
     pi.on('agent_start', () => {
       running = true;
+      started = true;
       failed = false;
       tools.clear();
       motion.change('thinking');
@@ -108,7 +137,10 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
     pi.on('message_end', event => {
       if (event.message.role === 'assistant') failed = ['error', 'length', 'aborted'].includes(event.message.stopReason);
     });
-    pi.on('session_before_compact', () => motion.change('compacting'));
+    pi.on('session_before_compact', () => {
+      started = true;
+      motion.change('compacting');
+    });
     pi.on('session_compact', () => motion.change(running ? 'thinking' : 'done'));
     pi.on('session_compact_failed', () => motion.change(running ? 'thinking' : 'paused'));
     pi.on('agent_settled', event => {
@@ -119,23 +151,20 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
     pi.on('session_start', (_event, ctx) => {
       if (!ctx.hasUI) return;
       ctx.ui.setHeader((tui, theme) => {
-        let compact;
-        let full;
+        const panel = mascotPanel(theme);
         return {
           render(width) {
             const height = tui.terminal.rows;
-            let image;
-            if (width >= 40 && height >= 22 && getCapabilities().images) {
-              image = height < 28
-                ? (compact ??= createMascotImage(theme, 8))
-                : (full ??= createMascotImage(theme, 12));
-            }
-            return renderDashboardHeader(width, height, theme, image);
+            if (started) return fit([theme.fg('accent', theme.bold('TactixCore Code'))], width);
+            return renderDashboardHeader(width, height, theme, getCapabilities().images ? {
+              render: columns => panel.render(columns, Math.min(21, height - 13), 'idle')
+            } : undefined);
           },
-          invalidate() { compact?.invalidate(); full?.invalidate(); }
+          invalidate: panel.invalidate
         };
       });
       ctx.ui.setWidget('tactixcore-mascot', (tui, theme) => {
+        const panel = mascotPanel(theme);
         let timer;
         const redraw = () => {
           tui.requestRender();
@@ -152,15 +181,9 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
         const removeMotion = motion.subscribe(redraw);
         return {
           render(width) {
-            const pose = motion.pose(activeWorkers(), reduced);
-            if (!pose.visible) return [];
-            const label = theme.fg('accent', pose.label);
-            if (width < 38 || tui.terminal.rows < 24) return [truncateToWidth(label, width)];
-            const sprite = renderMascotThumbnail(tui.terminal.rows >= 32 ? 16 : 10, undefined, pose.frame);
-            const center = Math.floor(sprite.length / 2);
-            return sprite.map((line, row) => truncateToWidth(line + (row === center ? '   ' + label : ''), width));
+            return renderWorkingMascot(width, tui.terminal.rows, theme, motion.pose(activeWorkers(), reduced), panel);
           },
-          invalidate() {},
+          invalidate: panel.invalidate,
           dispose() { removeMotion(); clearInterval(timer); }
         };
       });
@@ -177,6 +200,33 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
           dispose() { removeBranch(); removeUsage(); }
         };
       });
+    });
+    pi.registerCommand('mascot', {
+      description: 'View all six mascot poses at a larger size',
+      handler: async (_args, ctx) => {
+        if (!ctx.hasUI) return;
+        await ctx.ui.custom((tui, theme, _keys, done) => {
+          let index = 0;
+          const panel = mascotPanel(theme);
+          return {
+            render(width) {
+              const names = ['Idle', 'Thinking', 'Dribbling', 'Kick', 'Celebrating', 'Concerned'];
+              const heading = theme.fg('accent', theme.bold(`Luke · ${names[index]} (${index + 1}/6)`));
+              return [...fit([heading, '← / → or 1–6    Esc to close'], width),
+                ...panel.render(width, Math.max(4, Math.min(26, tui.terminal.rows - 9)), mascotFrames[index])];
+            },
+            invalidate: panel.invalidate,
+            handleInput(data) {
+              if (matchesKey(data, 'escape') || matchesKey(data, 'enter')) return done(undefined);
+              if (matchesKey(data, 'left')) index = (index + 5) % 6;
+              else if (matchesKey(data, 'right')) index = (index + 1) % 6;
+              else if (/^[1-6]$/.test(data)) index = Number(data) - 1;
+              else return;
+              tui.requestRender();
+            }
+          };
+        });
+      }
     });
     pi.registerCommand('usage', {
       description: 'Show OpenRouter token and cost details for this session',

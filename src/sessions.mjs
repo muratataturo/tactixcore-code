@@ -82,7 +82,7 @@ export function sessionRecorder(profile, manager, usageLedger, enabled) {
       usageLedger.record(record);
       const { usage } = record;
       write({
-        type: 'inference', source: reason(record.source, ['conversation', 'summary', 'subagent']),
+        type: 'inference', source: reason(record.source, ['conversation', 'summary', 'subagent', 'web_search']),
         model: modelName(record.model), requested_model: modelName(record.requestedModel),
         outcome: reason(record.outcome, ['completed', 'output_limit', 'context_overflow', 'timeout',
           'stream_interrupted', 'provider_error', 'http_error', 'aborted']),

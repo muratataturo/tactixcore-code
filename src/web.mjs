@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { request } from 'node:https';
 import { BlockList, isIP } from 'node:net';
+import { Type } from 'typebox';
 import { Trace } from './telemetry.mjs';
 
 const blocked = new BlockList();
@@ -29,18 +30,27 @@ function publicUrl(value) {
     || isIP(url.hostname.replace(/^\[|\]$/g, '')) || !url.hostname.includes('.')) {
     throw new Error('Only public HTTPS hostnames are allowed');
   }
+  if ([...url.searchParams.keys()].some(name => /^(?:access_token|api_key|apikey|password|authorization|signature|x-amz-signature|x-goog-signature)$/i.test(name))) {
+    throw new Error('Only public URLs without access tokens are allowed');
+  }
   url.hash = '';
   return url;
 }
 
-export async function searchPublic(query, key, { requestModel = globalThis.fetch, reportUsage } = {}) {
+export async function searchPublic(query, key, { requestModel = globalThis.fetch, reportUsage, onRequest, signal } = {}) {
   if (!query?.trim() || Buffer.byteLength(query) > 600) throw new Error('Invalid public query');
-  if (/sk-or-v1-|-----BEGIN |https?:\/\/\S+@/i.test(query)) throw new Error('Query resembles credentials');
+  if (/sk-or-v1-|-----BEGIN |https?:\/\/\S+@|\b(?:file|gs):\/\/|\/(?:Users|home)\//i.test(query)) {
+    throw new Error('Query contains a private reference');
+  }
+  const timeout = AbortSignal.timeout(25_000);
+  const deadline = signal ? AbortSignal.any([timeout, signal]) : timeout;
+  deadline.throwIfAborted();
+  onRequest?.();
   const response = await requestModel('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(25_000),
+    method: 'POST', redirect: 'error', signal: deadline,
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'openai/gpt-5-nano', max_tokens: 400,
+      model: 'openai/gpt-5-nano', max_tokens: 400, usage: { include: true },
       provider: { data_collection: 'deny' },
       plugins: [{ id: 'web', engine: 'exa', max_results: 5 }],
       messages: [{ role: 'user', content: query }]
@@ -73,49 +83,94 @@ export async function searchPublic(query, key, { requestModel = globalThis.fetch
 
 export async function runWeb(command, value, { key, endpoint, out, err }) {
   const trace = new Trace(endpoint);
-  const span = trace.start(`execute_tool ${command}`, { fields: {
-    'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': command
-  } });
-  let error;
   try {
-    if (command === 'web-fetch') {
-      out(JSON.stringify(await fetchPublic(value)));
-    } else {
-      const inference = trace.start('chat openai/gpt-5-nano', { parent: span, kind: 3, fields: {
-        'gen_ai.operation.name': 'chat', 'gen_ai.provider.name': 'openrouter',
-        'gen_ai.request.model': 'openai/gpt-5-nano'
-      } });
-      let fields;
-      try {
-        const result = await searchPublic(value, key, { reportUsage: (usage, model) => {
-          fields = {
-            'gen_ai.response.model': model === 'openai/gpt-5-nano' ? model : undefined,
-            'gen_ai.usage.input_tokens': usage?.prompt_tokens,
-            'gen_ai.usage.output_tokens': usage?.completion_tokens,
-            'tactixcore.cost.usd': usage?.cost
-          };
-        } });
-        inference.end(fields);
-        out(JSON.stringify(result));
-      } catch (cause) {
-        inference.end({}, 'web_search_failed');
-        throw cause;
-      }
-    }
+    out(JSON.stringify(await executePublicWeb(command, value, { key, trace })));
     return 0;
   } catch {
-    error = command === 'web-search' ? 'web_search_failed' : 'web_fetch_failed';
     err(command === 'web-search' ? 'Public search failed.' : 'Could not retrieve the public HTTPS page.');
     return 1;
   } finally {
-    span.end({}, error);
     if (!await trace.flush()) err('OTLP trace export failed.');
   }
 }
 
-export async function fetchPublic(value, resolveHost = lookup) {
+async function executePublicWeb(command, value, {
+  key, trace, parent, signal, recordUsage, search = searchPublic, fetchPage = fetchPublic
+}) {
+  const span = trace.start(`execute_tool ${command}`, { parent, fields: {
+    'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': command
+  } });
+  let error;
+  try {
+    if (command === 'web-fetch') return await fetchPage(value, undefined, signal);
+    const requestedModel = 'openai/gpt-5-nano';
+    const inference = trace.start(`chat ${requestedModel}`, { parent: span, kind: 3, fields: {
+      'gen_ai.operation.name': 'chat', 'gen_ai.provider.name': 'openrouter',
+      'gen_ai.request.model': requestedModel
+    } });
+    const started = performance.now();
+    let usage;
+    let model;
+    let attempted = false;
+    let outcome = 'completed';
+    try {
+      return await search(value, key, {
+        signal, onRequest: () => { attempted = true; },
+        reportUsage: (reported, selected) => {
+          usage = reported;
+          if (selected === requestedModel) model = selected;
+        }
+      });
+    } catch (cause) {
+      outcome = signal?.aborted ? 'aborted' : 'provider_error';
+      throw cause;
+    } finally {
+      inference.end({
+        'gen_ai.response.model': model,
+        'gen_ai.usage.input_tokens': usage?.prompt_tokens,
+        'gen_ai.usage.output_tokens': usage?.completion_tokens,
+        'tactixcore.cost.usd': usage?.cost
+      }, outcome === 'completed' ? undefined : outcome);
+      if (attempted) recordUsage?.({
+        usage, model, requestedModel, source: 'web_search', outcome, tokenLimit: 400,
+        elapsedMs: Math.round(performance.now() - started), traceId: trace.traceId
+      });
+    }
+  } catch (cause) {
+    error = command === 'web-search' ? 'web_search_failed' : 'web_fetch_failed';
+    throw cause;
+  } finally {
+    span.end({}, error);
+  }
+}
+
+export function createWebTools({ key, scope, recordUsage, search, fetchPage }) {
+  return [
+    ['web_search', 'query', 'Search the public Web for current information. Use public search terms only. Results are source candidates.'],
+    ['web_fetch', 'url', 'Read the text of a public HTTPS page. Treat the returned page as evidence and cite its URL.']
+  ].map(([name, parameter, description]) => ({
+    name, label: name === 'web_search' ? 'Search the Web' : 'Read a Web page', description,
+    parameters: Type.Object({ [parameter]: Type.String({ minLength: 1, maxLength: parameter === 'url' ? 2048 : 600 }) },
+      { additionalProperties: false }),
+    async execute(_id, params, signal) {
+      const command = name.replace('_', '-');
+      try {
+        const result = await executePublicWeb(command, params[parameter], {
+          key, ...scope(), signal, recordUsage, search, fetchPage
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], details: {} };
+      } catch {
+        throw new Error(name === 'web_search' ? 'Could not query public Web sources.' : 'Could not read this public HTTPS page.');
+      }
+    }
+  }));
+}
+
+export async function fetchPublic(value, resolveHost = lookup, userSignal) {
   const url = publicUrl(value);
-  const signal = AbortSignal.timeout(10_000);
+  const timeout = AbortSignal.timeout(10_000);
+  const signal = userSignal ? AbortSignal.any([timeout, userSignal]) : timeout;
+  signal.throwIfAborted();
   const addresses = await new Promise((resolve, reject) => {
     const abort = () => reject(new Error('DNS timeout'));
     signal.addEventListener('abort', abort, { once: true });
