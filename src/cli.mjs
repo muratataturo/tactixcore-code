@@ -4,6 +4,7 @@ import { parseArgs, parseEnv } from 'node:util';
 const help = `Usage
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
+  tactixcore-code pi --prompt TEXT [--env-file PATH] [--model MODEL] [--otlp-endpoint URL]
 
 Use an external dotenv file or an existing OPENROUTER_API_KEY environment variable.
 doctor checks local configuration. check-openrouter queries key status only.`;
@@ -45,7 +46,7 @@ export async function main(args, {
     out(help);
     return 0;
   }
-  if (command !== 'doctor' && command !== 'check-openrouter') {
+  if (!['doctor', 'check-openrouter', 'pi'].includes(command)) {
     err(help);
     return 2;
   }
@@ -53,7 +54,13 @@ export async function main(args, {
   try {
     ({ values } = parseArgs({
       args: flags,
-      options: { 'env-file': { type: 'string' }, help: { type: 'boolean' } }
+      options: {
+        'env-file': { type: 'string' }, help: { type: 'boolean' },
+        ...(command === 'pi' ? {
+          prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' },
+          'otlp-endpoint': { type: 'string' }
+        } : {})
+      }
     }));
   } catch {
     err(help);
@@ -74,6 +81,23 @@ export async function main(args, {
   if (command === 'doctor') {
     out('OpenRouter key configured. Run check-openrouter to verify credentials.');
     return 0;
+  }
+  if (command === 'pi') {
+    if (!values.prompt?.trim() || Buffer.byteLength(values.prompt) > 16_384) {
+      err('Provide a --prompt between 1 and 16384 UTF-8 bytes.');
+      return 2;
+    }
+    try {
+      const { runPi } = await import('./pi.mjs');
+      return await runPi({
+        key, prompt: values.prompt, model: values.model, stage: values.stage,
+        endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+        out, err
+      });
+    } catch {
+      err('Pi could not complete the request. Check the model, stage, and configured endpoint.');
+      return 1;
+    }
   }
 
   try {

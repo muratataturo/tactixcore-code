@@ -6,7 +6,11 @@
   "type": "module",
   "engines": { "node": ">=22.19.0" },
   "bin": { "tactixcore-code": "bin/tactixcore-code.mjs" },
-  "files": ["bin/tactixcore-code.mjs", "src/cli.mjs"],
+  "files": ["bin/tactixcore-code.mjs", "src/*.mjs", "skills/*/SKILL.md"],
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0"
+  },
   "scripts": {
     "test": "node --test",
     "check:public": "node scripts/check-public-tree.mjs"
