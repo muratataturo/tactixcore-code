@@ -3,13 +3,14 @@ import { parseArgs, parseEnv } from 'node:util';
 import { profileDirectory, saveEnvFile, selectEnvFile } from './profile.mjs';
 
 const help = `Usage
-  tactixcore-code [--env-file PATH] [--model MODEL]
+  tactixcore-code [--env-file PATH] [--model MODEL] [--max-output-tokens N] [--no-session]
   tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
   tactixcore-code pi --prompt TEXT --skill SKILL --playground PATH --team ID --game ID --analysis-input FILE
   tactixcore-code skills list
+  tactixcore-code sessions list | inspect SESSION_ID | path SESSION_ID
   tactixcore-code run SKILL --playground PATH --team ID --game ID --input FILE [--dry-run]
   tactixcore-code web-search --query PUBLIC_QUERY [--env-file PATH]
   tactixcore-code web-fetch --url PUBLIC_HTTPS_URL
@@ -59,6 +60,10 @@ export async function main(args, {
   const defaultCommand = first === undefined || first.startsWith('--');
   const command = defaultCommand ? 'pi' : first;
   const flags = defaultCommand ? args : args.slice(1);
+  if (command === 'sessions') {
+    const { runSessionsCommand } = await import('./sessions.mjs');
+    return runSessionsCommand(flags, { profile: profileDirectory(env), out, err });
+  }
   if (command === 'skills' || command === 'run') {
     const { runAnalysisCommand } = await import('./analysis-cli.mjs');
     return runAnalysisCommand(command, flags, { env, out, err });
@@ -80,6 +85,7 @@ export async function main(args, {
         ...(command === 'pi' ? {
           prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' }, skill: { type: 'string' },
           'otlp-endpoint': { type: 'string' }, 'analysis-input': { type: 'string' },
+          'max-output-tokens': { type: 'string' }, 'no-session': { type: 'boolean' },
           playground: { type: 'string' }, team: { type: 'string' }, game: { type: 'string' },
           opponent: { type: 'string' }, player: { type: 'string' }
         } : {}),
@@ -96,6 +102,12 @@ export async function main(args, {
     return 0;
   }
   const interactive = command === 'pi' && values.prompt === undefined;
+  const outputBudget = values['max-output-tokens'];
+  const maxTokens = outputBudget === undefined ? undefined : Number(outputBudget);
+  if (outputBudget !== undefined && (!/^\d+$/.test(outputBudget) || maxTokens < 1024 || maxTokens > 24576)) {
+    err('--max-output-tokens must be an integer between 1024 and 24576.');
+    return 2;
+  }
   if (interactive && !isTerminal) {
     err('Pi interactive mode requires a terminal. Use pi --prompt TEXT for one-shot use.');
     return 2;
@@ -148,7 +160,7 @@ export async function main(args, {
         await openInteractivePi({
           key, envFile, model: values.model, stage: values.stage, skill: values.skill,
           endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-          profile: profileDirectory(env)
+          profile: profileDirectory(env), maxTokens, persist: !values['no-session']
         });
         return 0;
       } catch {
@@ -173,7 +185,7 @@ export async function main(args, {
       return await runPi({
         key, prompt: values.prompt, model: values.model, stage: values.stage, skill: values.skill,
         endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-        analysis, env, out, err
+        analysis, env, out, err, maxTokens
       });
     } catch {
       err('Pi could not complete the request. Check the model, endpoint, and any selected analysis inputs.');

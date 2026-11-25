@@ -1,7 +1,7 @@
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager
 } from '@earendil-works/pi-coding-agent';
-import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
+import { InMemoryCredentialStore, InMemoryModelsStore, isContextOverflow } from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
 import { Type } from 'typebox';
 import { Trace } from './telemetry.mjs';
@@ -11,6 +11,7 @@ import { executeAnalysis } from './analysis.mjs';
 const provider = 'tactixcore-openrouter';
 const origin = 'https://openrouter.ai/api/v1';
 const routingPolicyVersion = '1';
+export const contextWindow = 96_000;
 const routes = {
   triage: { tier: 'low', models: ['openai/gpt-5-nano', 'openai/gpt-5-mini'] },
   synthesis: { tier: 'medium', models: ['openai/gpt-5-mini', 'openai/gpt-5.4-mini'] }
@@ -28,7 +29,7 @@ export function resolveRoute(model = 'agentrouter/auto', stage = 'triage') {
 
 export function openRouterStream({
   trace, parent, route, key, fetchModel = globalThis.fetch, analysis,
-  maxRequests = analysis ? 2 : 1, maxTokens = 512, recordUsage
+  maxRequests = analysis ? 2 : 1, maxTokens = 512, recordUsage, sessionKey
 }) {
   let requests = 0;
   return (model, context, options) => {
@@ -51,10 +52,14 @@ export function openRouterStream({
     let httpStatus;
     let policyError;
     let requested = false;
+    let finishReason;
+    const tokenLimit = Math.min(maxTokens, options?.maxTokens ?? maxTokens);
+    const summary = Boolean(sessionKey) && options?.cacheRetention === 'none';
+    const started = performance.now();
     try {
       const stream = streamSimple(model, context, {
-        ...options, apiKey: key, maxRetries: 0, maxTokens, timeoutMs: 60_000,
-        cacheRetention: 'none',
+        ...options, apiKey: key, maxRetries: 0, maxTokens: tokenLimit, timeoutMs: 120_000,
+        cacheRetention: sessionKey && !summary ? 'short' : 'none',
         headers: { 'X-OpenRouter-Metadata': 'enabled' },
         fetch: async (input, init) => {
           const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
@@ -70,6 +75,7 @@ export function openRouterStream({
             ...enriched,
             model: route.id,
             usage: { include: true },
+            ...(sessionKey && !summary ? { session_id: sessionKey() } : {}),
             provider: { data_collection: 'deny', require_parameters: true },
             ...(analysis ? { tool_choice: turn === 1 ? 'required' : 'none' } : {}),
             ...(route.id === 'openrouter/auto' ? {
@@ -84,12 +90,19 @@ export function openRouterStream({
             throw new Error('OpenRouter returned a model outside the routing policy');
           }
           if (chunk.usage) usage = { ...usage, ...chunk.usage };
+          const reported = chunk.choices?.[0]?.finish_reason;
+          if (['stop', 'length', 'tool_calls', 'content_filter', 'error'].includes(reported)) finishReason = reported;
           if (chunk.openrouter_metadata) metadata = chunk.openrouter_metadata;
           await options?.onProviderStreamEvent?.(chunk, requestModel);
         }
       });
       void stream.result().then(message => {
-        if (requested) recordUsage?.({ usage, model: actualModel });
+        const outcome = responseOutcome(message, httpStatus);
+        if (requested) recordUsage?.({
+          usage, model: actualModel, requestedModel: route.id, source: summary ? 'summary' : 'conversation',
+          finishReason, outcome, httpStatus, tokenLimit, elapsedMs: Math.round(performance.now() - started),
+          traceId: trace.traceId
+        });
         const attempts = Array.isArray(metadata?.attempts) ? metadata.attempts.length : undefined;
         const position = Number.isSafeInteger(metadata?.attempt) ? metadata.attempt : undefined;
         const routingStrategy = ['direct', 'auto', 'free', 'latest', 'alias', 'fallback', 'pareto', 'bodybuilder', 'fusion']
@@ -98,6 +111,9 @@ export function openRouterStream({
           'gen_ai.response.model': actualModel,
           'gen_ai.usage.input_tokens': usage?.prompt_tokens,
           'gen_ai.usage.output_tokens': usage?.completion_tokens,
+          'gen_ai.usage.cache_read.input_tokens': usage?.prompt_tokens_details?.cached_tokens,
+          'tactixcore.response.outcome': outcome,
+          'tactixcore.request.output_limit': tokenLimit,
           'tactixcore.cost.usd': usage?.cost,
           'tactixcore.routing.metadata_observed': Boolean(metadata),
           'tactixcore.routing.provider_attempts': attempts ?? position,
@@ -107,7 +123,11 @@ export function openRouterStream({
         }, policyError ? 'model_outside_policy' : ['error', 'aborted'].includes(message.stopReason)
           ? (httpStatus >= 400 ? String(httpStatus) : message.stopReason) : undefined);
       }, () => {
-        if (requested) recordUsage?.({ usage, model: actualModel });
+        if (requested) recordUsage?.({
+          usage, model: actualModel, requestedModel: route.id, source: summary ? 'summary' : 'conversation',
+          finishReason, outcome: 'stream_interrupted', httpStatus, tokenLimit,
+          elapsedMs: Math.round(performance.now() - started), traceId: trace.traceId
+        });
         span.end({}, 'stream_error');
       });
       return stream;
@@ -116,6 +136,19 @@ export function openRouterStream({
       throw new Error('OpenRouter stream could not start');
     }
   };
+}
+
+export function responseOutcome(message, status) {
+  if (message.stopReason === 'aborted') return 'aborted';
+  if (isContextOverflow(message, contextWindow)) return 'context_overflow';
+  if (message.stopReason === 'length') return 'output_limit';
+  if (message.stopReason !== 'error') return 'completed';
+  if (status >= 400) return 'http_error';
+  if (/timeout|timed out/i.test(message.errorMessage ?? '')) return 'timeout';
+  if (/without finish_reason|terminated|socket|fetch failed|connection|network error/i.test(message.errorMessage ?? '')) {
+    return 'stream_interrupted';
+  }
+  return 'provider_error';
 }
 
 export async function createOpenRouterRuntime(route, stream, maxTokens = 512) {
@@ -128,7 +161,7 @@ export async function createOpenRouterRuntime(route, stream, maxTokens = 512) {
     streamSimple: stream,
     models: [{
       id: route.id, name: route.id, input: ['text'],
-      contextWindow: 16_384, maxTokens, reasoning: false,
+      contextWindow, maxTokens, reasoning: false,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: { supportsStore: false }
     }]
@@ -138,7 +171,8 @@ export async function createOpenRouterRuntime(route, stream, maxTokens = 512) {
 
 export async function runPi({
   key, prompt, model, stage, skill, endpoint, out, err,
-  analysis, env = process.env, analysisStart, fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch
+  analysis, env = process.env, analysisStart, fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch,
+  maxTokens = analysis ? 512 : 4096
 }) {
   const route = resolveRoute(model, stage);
   const guidance = skill ? readBundledSkill(skill) : null;
@@ -157,8 +191,8 @@ export async function runPi({
   const toolName = 'run_scoped_soccer_analysis';
   try {
     const runtime = await createOpenRouterRuntime(route, openRouterStream({
-      trace, parent: root, route, key, fetchModel, analysis
-    }));
+      trace, parent: root, route, key, fetchModel, analysis, maxTokens
+    }), maxTokens);
     const resourceLoader = new DefaultResourceLoader({
       cwd, agentDir: cwd, settingsManager, noExtensions: true, noSkills: true,
       noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -194,7 +228,13 @@ export async function runPi({
     await session.prompt(prompt, { expandPromptTemplates: false });
     const answer = session.getLastAssistantText();
     const last = session.messages.findLast(message => message.role === 'assistant');
-    if (!answer?.trim() || ['error', 'aborted', 'length'].includes(last?.stopReason)) {
+    if (last?.stopReason === 'length') {
+      if (answer?.trim()) out(answer);
+      failure = responseOutcome(last);
+      err('The answer reached a token limit. Use a smaller task or increase --max-output-tokens.');
+      return 1;
+    }
+    if (!answer?.trim() || ['error', 'aborted'].includes(last?.stopReason)) {
       failure = 'missing_response';
       err('Pi returned no answer. Check OpenRouter authentication, quota, and model availability.');
       return 1;

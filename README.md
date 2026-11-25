@@ -36,6 +36,22 @@ Pi の画面で普通に入力すると、同じ会話のまま続けられま�
 
 起動画面のポメラニアンは、Kitty 画像プロトコルに対応した端末や iTerm2 では PNG で表示します。iTerm2 では PNG 表示に対応する Pi の通常画面モードで起動します。画像プロトコルのない端末では、同じイラストを端末の文字セルに合わせたサムネイルで表示します。
 
+## 長い対話とセッションの調査
+
+対話モードの出力上限は1リクエストあたり12,288トークンです。必要に応じて `tactixcore-code --max-output-tokens 16384` で調整できます。コンテキストが上限に近づくと、Pi が古い会話を要約し、最近の会話を残します。`/compact` で手動圧縮を実行できます。圧縮はモデルを1回以上呼び出すことがあります。
+
+OpenRouter には対話ごとの識別子を渡し、対応プロバイダーの短期キャッシュを再利用しやすくしています。キャッシュが命中した場合は `/usage` の Cache read に反映されます。
+
+```sh
+tactixcore-code sessions list
+tactixcore-code sessions inspect SESSION_ID
+tactixcore-code sessions path SESSION_ID
+```
+
+対話は Pi の JSONL 形式で `~/.config/tactixcore-code/agent/sessions/` に保存します。環境変数 `XDG_CONFIG_HOME` を設定した場合はその配下を使います。JSONL には依頼、応答、ツール結果が含まれます。記録しない対話は `tactixcore-code --no-session` で起動します。Pi の `/resume` で保存済みの対話を再開できます。
+
+`sessions inspect` は本文を出さず、モデル、終了理由、トークン、OpenRouter が返した費用、圧縮結果、トレース ID を JSON で返します。分析用ログは同じ設定ディレクトリの `diagnostics/` に保存します。OpenRouter の費用を確認する場合はこのログを参照してください。
+
 設定ファイルに保存するのは dotenv のパスです。OpenRouter キーは起動のたびに元ファイルから読みます。1回だけ別の設定を使う場合は `tactixcore-code --env-file PATH` を使えます。
 
 ## OpenRouter と Pi

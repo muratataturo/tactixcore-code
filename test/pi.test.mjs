@@ -61,3 +61,38 @@ test('Pi streams a routed answer and exports only approved OTLP attributes', asy
   assert.equal(fields['gen_ai.response.model'].stringValue, 'openai/gpt-5-nano');
   assert.equal(fields['tactixcore.cost.usd'].doubleValue, 0.000001);
 });
+
+test('interactive routing keeps cache affinity, honors output budgets, and records length separately', async () => {
+  const { createOpenRouterRuntime, openRouterStream, responseOutcome } = await import('../src/pi.mjs');
+  const { Trace } = await import('../src/telemetry.mjs');
+  const requests = [];
+  const observed = [];
+  const route = resolveRoute('openai/gpt-5-nano');
+  const trace = new Trace();
+  const stream = openRouterStream({
+    trace, route, key: fixtureKey, maxRequests: 3, maxTokens: 12288,
+    sessionKey: () => 'same-session-key',
+    recordUsage: record => observed.push(record),
+    fetchModel: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      const base = { id: 'gen-fixture', created: 1, object: 'chat.completion.chunk', model: route.id };
+      const chunks = [
+        { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: 'Partial answer' }, finish_reason: null }] },
+        { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'length' }] },
+        { ...base, choices: [], usage: { prompt_tokens: 18, completion_tokens: 8, total_tokens: 26, cost: 0.001 } }
+      ];
+      return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n',
+        { headers: { 'Content-Type': 'text/event-stream' } });
+    }
+  });
+  const { model } = await createOpenRouterRuntime(route, stream, 12288);
+  const prompt = { messages: [{ role: 'user', content: 'Hello', timestamp: Date.now() }] };
+  await stream(model, prompt).result();
+  await stream(model, prompt).result();
+  await stream(model, prompt, { cacheRetention: 'none', maxTokens: 2048 }).result();
+  assert.deepEqual(requests.map(request => request.session_id), ['same-session-key', 'same-session-key', undefined]);
+  assert.deepEqual(requests.map(request => request.max_tokens ?? request.max_completion_tokens), [12288, 12288, 2048]);
+  assert.deepEqual(observed.map(item => item.outcome), ['output_limit', 'output_limit', 'output_limit']);
+  assert.equal(observed[2].source, 'summary');
+  assert.equal(responseOutcome({ stopReason: 'error', errorMessage: 'Stream ended without finish_reason' }), 'stream_interrupted');
+});

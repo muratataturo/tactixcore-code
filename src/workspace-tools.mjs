@@ -7,9 +7,10 @@ const privateName = /^(?:\.(?!github$|gitignore$|editorconfig$)|node_modules$|au
 const credential = /sk-or-v1-[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|"type"\s*:\s*"service_account"/;
 const maxFileSize = 256 * 1024;
 
-export function workspaceTools(directory, envFile) {
+export function workspaceTools(directory, envFile, privateDirectories = []) {
   const root = realpathSync(directory);
   const secret = envFile ? realpathSync(envFile) : null;
+  const privatePaths = new Set(privateDirectories.flatMap(path => [resolve(path), realpathSync(path)]));
 
   function check(path, { directoryOnly = false, create = false } = {}) {
     const full = resolve(root, path);
@@ -21,7 +22,7 @@ export function workspaceTools(directory, envFile) {
     for (const [index, part] of parts.entries()) {
       if (privateName.test(part)) throw new Error('Path is protected.');
       cursor = join(cursor, part);
-      if (cursor === secret) throw new Error('Path is protected.');
+      if (cursor === secret || privatePaths.has(cursor)) throw new Error('Path is protected.');
       const info = lstatSync(cursor, { throwIfNoEntry: false });
       if (!info && create) continue;
       if (!info || info.isSymbolicLink()) throw new Error('File is unavailable or is a symbolic link.');
@@ -60,6 +61,7 @@ export function workspaceTools(directory, envFile) {
       const directory = check(path ?? '.', { directoryOnly: true });
       const names = readdirSync(directory, { withFileTypes: true })
         .filter(entry => !entry.isSymbolicLink() && !privateName.test(entry.name)
+          && !privatePaths.has(join(directory, entry.name))
           && !(directory === (secret && resolve(secret, '..')) && entry.name === basename(secret)))
         .map(entry => entry.name + (entry.isDirectory() ? '/' : '')).sort().slice(0, 200);
       return { content: [{ type: 'text', text: JSON.stringify(names) }], details: {} };
