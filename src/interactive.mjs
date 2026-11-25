@@ -9,6 +9,8 @@ import { bundledSkills, readBundledSkill } from './analysis-cli.mjs';
 import { createOpenRouterRuntime, openRouterStream, resolveRoute } from './pi.mjs';
 import { Trace } from './telemetry.mjs';
 import { workspaceTools } from './workspace-tools.mjs';
+import { dashboardExtension } from './dashboard.mjs';
+import { createUsageLedger } from './usage.mjs';
 
 const maxTokens = 4096;
 
@@ -36,6 +38,7 @@ export async function openInteractivePi({ key, envFile, model, stage, skill, end
   ].filter(Boolean).join('\n\n');
 
   const runtime = await createAgentSessionRuntime(async sessionOptions => {
+    const usage = createUsageLedger();
     const newTurn = () => {
       const trace = new Trace(endpoint);
       const parent = trace.start('invoke_agent tactixcore-code', { fields: {
@@ -43,7 +46,9 @@ export async function openInteractivePi({ key, envFile, model, stage, skill, end
       } });
       return {
         trace, parent,
-        stream: openRouterStream({ trace, parent, route, key, maxRequests: 12, maxTokens })
+        stream: openRouterStream({
+          trace, parent, route, key, maxRequests: 12, maxTokens, recordUsage: usage.record
+        })
       };
     };
     let turn;
@@ -52,6 +57,7 @@ export async function openInteractivePi({ key, envFile, model, stage, skill, end
       cwd, agentDir, modelRuntime: provider.modelRuntime, settingsManager,
       resourceLoaderOptions: {
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{ name: 'tactixcore-dashboard', factory: dashboardExtension(usage) }],
         additionalSkillPaths: bundledSkills.map(name => fileURLToPath(new URL(`../skills/${name}/SKILL.md`, import.meta.url))),
         systemPrompt
       }

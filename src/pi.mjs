@@ -28,7 +28,7 @@ export function resolveRoute(model = 'agentrouter/auto', stage = 'triage') {
 
 export function openRouterStream({
   trace, parent, route, key, fetchModel = globalThis.fetch, analysis,
-  maxRequests = analysis ? 2 : 1, maxTokens = 512
+  maxRequests = analysis ? 2 : 1, maxTokens = 512, recordUsage
 }) {
   let requests = 0;
   return (model, context, options) => {
@@ -50,6 +50,7 @@ export function openRouterStream({
     let metadata;
     let httpStatus;
     let policyError;
+    let requested = false;
     try {
       const stream = streamSimple(model, context, {
         ...options, apiKey: key, maxRetries: 0, maxTokens, timeoutMs: 60_000,
@@ -58,6 +59,7 @@ export function openRouterStream({
         fetch: async (input, init) => {
           const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
           if (url.href !== origin + '/chat/completions') throw new Error('Unexpected OpenRouter endpoint');
+          requested = true;
           const response = await fetchModel(input, { ...init, redirect: 'error' });
           httpStatus = response.status;
           return response;
@@ -67,6 +69,7 @@ export function openRouterStream({
           return {
             ...enriched,
             model: route.id,
+            usage: { include: true },
             provider: { data_collection: 'deny', require_parameters: true },
             ...(analysis ? { tool_choice: turn === 1 ? 'required' : 'none' } : {}),
             ...(route.id === 'openrouter/auto' ? {
@@ -80,12 +83,13 @@ export function openRouterStream({
             policyError = true;
             throw new Error('OpenRouter returned a model outside the routing policy');
           }
-          if (chunk.usage) usage = chunk.usage;
+          if (chunk.usage) usage = { ...usage, ...chunk.usage };
           if (chunk.openrouter_metadata) metadata = chunk.openrouter_metadata;
           await options?.onProviderStreamEvent?.(chunk, requestModel);
         }
       });
       void stream.result().then(message => {
+        if (requested) recordUsage?.({ usage, model: actualModel });
         const attempts = Array.isArray(metadata?.attempts) ? metadata.attempts.length : undefined;
         const position = Number.isSafeInteger(metadata?.attempt) ? metadata.attempt : undefined;
         const routingStrategy = ['direct', 'auto', 'free', 'latest', 'alias', 'fallback', 'pareto', 'bodybuilder', 'fusion']
@@ -102,7 +106,10 @@ export function openRouterStream({
           'http.response.status_code': httpStatus
         }, policyError ? 'model_outside_policy' : ['error', 'aborted'].includes(message.stopReason)
           ? (httpStatus >= 400 ? String(httpStatus) : message.stopReason) : undefined);
-      }, () => span.end({}, 'stream_error'));
+      }, () => {
+        if (requested) recordUsage?.({ usage, model: actualModel });
+        span.end({}, 'stream_error');
+      });
       return stream;
     } catch {
       span.end({}, 'stream_setup');
