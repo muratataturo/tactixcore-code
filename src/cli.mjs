@@ -1,7 +1,10 @@
 import { constants, openSync, closeSync, fstatSync, readSync } from 'node:fs';
 import { parseArgs, parseEnv } from 'node:util';
+import { profileDirectory, saveEnvFile, selectEnvFile } from './profile.mjs';
 
 const help = `Usage
+  tactixcore-code [--env-file PATH] [--model MODEL]
+  tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
@@ -45,13 +48,17 @@ export async function main(args, {
   env = process.env,
   fetchKey = globalThis.fetch,
   out = console.log,
-  err = console.error
+  err = console.error,
+  isTerminal = process.stdin.isTTY && process.stdout.isTTY
 } = {}) {
-  const [command, ...flags] = args;
-  if (command === undefined || command === '--help' || command === 'help') {
+  const first = args[0];
+  if (first === '--help' || first === 'help') {
     out(help);
     return 0;
   }
+  const defaultCommand = first === undefined || first.startsWith('--');
+  const command = defaultCommand ? 'pi' : first;
+  const flags = defaultCommand ? args : args.slice(1);
   if (command === 'skills' || command === 'run') {
     const { runAnalysisCommand } = await import('./analysis-cli.mjs');
     return runAnalysisCommand(command, flags, { env, out, err });
@@ -60,7 +67,7 @@ export async function main(args, {
     const { runImproveCommand } = await import('./improve.mjs');
     return runImproveCommand(flags, { env, out, err });
   }
-  if (!['doctor', 'check-openrouter', 'pi', 'web-search', 'web-fetch'].includes(command)) {
+  if (!['configure', 'doctor', 'check-openrouter', 'pi', 'web-search', 'web-fetch'].includes(command)) {
     err(help);
     return 2;
   }
@@ -88,6 +95,15 @@ export async function main(args, {
     out(help);
     return 0;
   }
+  const interactive = command === 'pi' && values.prompt === undefined;
+  if (interactive && !isTerminal) {
+    err('Pi interactive mode requires a terminal. Use pi --prompt TEXT for one-shot use.');
+    return 2;
+  }
+  if (interactive && [values['analysis-input'], values.playground, values.team, values.game, values.player, values.opponent].some(value => value !== undefined)) {
+    err('Scoped match analysis requires pi --prompt TEXT.');
+    return 2;
+  }
   if (command === 'web-fetch') {
     try {
       const { runWeb } = await import('./web.mjs');
@@ -98,18 +114,48 @@ export async function main(args, {
     }
   }
 
+  if (command === 'configure' && !values['env-file']) {
+    err('Usage: tactixcore-code configure --env-file PATH');
+    return 2;
+  }
   let key;
+  let envFile;
   try {
-    key = readKey(values['env-file'], env);
+    envFile = selectEnvFile(values['env-file'], env);
+    key = readKey(envFile, env);
   } catch {
-    err('OpenRouter key unavailable. Check OPENROUTER_API_KEY in the selected source.');
+    err('OpenRouter key unavailable. Run tactixcore-code configure --env-file PATH.');
     return 1;
+  }
+  if (command === 'configure') {
+    try {
+      saveEnvFile(env, envFile);
+      out('OpenRouter credential file configured. Run tactixcore-code to start Pi.');
+      return 0;
+    } catch {
+      err('Could not save the credential file setting.');
+      return 1;
+    }
   }
   if (command === 'doctor') {
     out('OpenRouter key configured. Run check-openrouter to verify credentials.');
     return 0;
   }
   if (command === 'pi') {
+    if (interactive) {
+      try {
+        const { openInteractivePi } = await import('./interactive.mjs');
+        await openInteractivePi({
+          key, envFile, model: values.model, stage: values.stage, skill: values.skill,
+          endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+          profile: profileDirectory(env)
+        });
+        return 0;
+      } catch {
+        err('Pi could not start. Check the terminal, workspace, and configured model.');
+        return 1;
+      }
+    }
     if (!values.prompt?.trim() || Buffer.byteLength(values.prompt) > 16_384) {
       err('Provide a --prompt between 1 and 16384 UTF-8 bytes.');
       return 2;

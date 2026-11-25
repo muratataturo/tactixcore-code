@@ -16,10 +16,23 @@ node bin/tactixcore-code.mjs --help
 ```sh
 npm install --global --ignore-scripts --install-links .
 command -v tactixcore-code
-tactixcore-code skills list
+tactixcore-code --help
 ```
 
 インストール後に zsh でコマンドが見つからない場合は、`rehash` を実行してから再確認します。まだ見つからない場合は、`npm prefix --global` が返すディレクトリの `bin` が PATH に含まれているか確認してください。
+
+## Pi の対話画面を開く
+
+初回だけ OpenRouter キーが入った外部 dotenv の場所を登録します。その後は、編集したいプロジェクトのディレクトリで起動します。
+
+```sh
+tactixcore-code configure --env-file /path/to/tactixcore-playground/.env
+tactixcore-code
+```
+
+Pi の画面で普通に入力すると、同じ会話のまま続けられます。組み込み Skill は `/skill:` で選べます。コーディング用ツールは起動ディレクトリ内の閲覧・編集・作成に使えます。モデルにはシェル実行を公開していません。終了は空の入力欄で Ctrl+D、または `/quit` です。
+
+設定ファイルに保存するのは dotenv のパスです。OpenRouter キーは起動のたびに元ファイルから読みます。1回だけ別の設定を使う場合は `tactixcore-code --env-file PATH` を使えます。
 
 ## OpenRouter と Pi
 

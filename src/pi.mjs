@@ -26,11 +26,14 @@ export function resolveRoute(model = 'agentrouter/auto', stage = 'triage') {
   return { ...route, id: model, stage };
 }
 
-function openRouterStream({ trace, parent, route, key, fetchModel, analysis }) {
+export function openRouterStream({
+  trace, parent, route, key, fetchModel = globalThis.fetch, analysis,
+  maxRequests = analysis ? 2 : 1, maxTokens = 512
+}) {
   let requests = 0;
   return (model, context, options) => {
     const turn = ++requests;
-    if (turn > (analysis ? 2 : 1)) throw new Error('Pi request limit reached');
+    if (turn > maxRequests) throw new Error('Pi request limit reached');
     const span = trace.start(`chat ${route.id}`, {
       parent, kind: 3, fields: {
         'gen_ai.operation.name': 'chat',
@@ -49,7 +52,7 @@ function openRouterStream({ trace, parent, route, key, fetchModel, analysis }) {
     let policyError;
     try {
       const stream = streamSimple(model, context, {
-        ...options, apiKey: key, maxRetries: 0, maxTokens: 512, timeoutMs: 30_000,
+        ...options, apiKey: key, maxRetries: 0, maxTokens, timeoutMs: 60_000,
         cacheRetention: 'none',
         headers: { 'X-OpenRouter-Metadata': 'enabled' },
         fetch: async (input, init) => {
@@ -108,6 +111,24 @@ function openRouterStream({ trace, parent, route, key, fetchModel, analysis }) {
   };
 }
 
+export async function createOpenRouterRuntime(route, stream, maxTokens = 512) {
+  const modelRuntime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
+    modelsPath: null, refreshOnCreate: false
+  });
+  modelRuntime.registerProvider(provider, {
+    baseUrl: origin, api: 'openai-completions', apiKey: 'runtime-credential',
+    streamSimple: stream,
+    models: [{
+      id: route.id, name: route.id, input: ['text'],
+      contextWindow: 16_384, maxTokens, reasoning: false,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      compat: { supportsStore: false }
+    }]
+  });
+  return { modelRuntime, model: modelRuntime.getModel(provider, route.id) };
+}
+
 export async function runPi({
   key, prompt, model, stage, skill, endpoint, out, err,
   analysis, env = process.env, analysisStart, fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch
@@ -128,20 +149,9 @@ export async function runPi({
   let analysisState = 'not_started';
   const toolName = 'run_scoped_soccer_analysis';
   try {
-    const modelRuntime = await ModelRuntime.create({
-      credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
-      modelsPath: null, refreshOnCreate: false
-    });
-    modelRuntime.registerProvider(provider, {
-      baseUrl: origin, api: 'openai-completions', apiKey: 'runtime-credential',
-      streamSimple: openRouterStream({ trace, parent: root, route, key, fetchModel, analysis }),
-      models: [{
-        id: route.id, name: route.id, input: ['text'],
-        contextWindow: 16_384, maxTokens: 512, reasoning: false,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        compat: { supportsStore: false }
-      }]
-    });
+    const runtime = await createOpenRouterRuntime(route, openRouterStream({
+      trace, parent: root, route, key, fetchModel, analysis
+    }));
     const resourceLoader = new DefaultResourceLoader({
       cwd, agentDir: cwd, settingsManager, noExtensions: true, noSkills: true,
       noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -170,7 +180,7 @@ export async function runPi({
       }
     }] : [];
     ({ session } = await createAgentSession({
-      cwd, agentDir: cwd, modelRuntime, model: modelRuntime.getModel(provider, route.id),
+      cwd, agentDir: cwd, ...runtime,
       settingsManager, sessionManager: SessionManager.inMemory(cwd), resourceLoader,
       tools: analysis ? [toolName] : [], customTools
     }));
