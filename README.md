@@ -35,7 +35,7 @@ tactixcore-code pi --env-file ../tactixcore-playground/.env \
   --skill soccer-ownteam --prompt '試合の分析に用意すべき入力は？'
 ```
 
-`pi --skill` は組み込み Skill の手順を会話に追加します。分析の実処理には以下の `run` を使います。Pi に送る依頼文には、OpenRouter に送信可能な内容だけを入力してください。
+`pi --skill` は組み込み Skill の手順を会話に追加します。分析の実処理は以下の `run` または `pi --analysis-input` で開始できます。Pi に送る依頼文には、OpenRouter に送信可能な内容だけを入力してください。
 
 ## 実試合の分析
 
@@ -45,9 +45,13 @@ tactixcore-code run soccer-ownteam --team TEAM_ID --game GAME_ID --input ownteam
 tactixcore-code run soccer-ownteam --team TEAM_ID --game GAME_ID --input ownteam.json
 tactixcore-code run soccer-opponent --team TEAM_ID --game GAME_ID --opponent OPPONENT_ID --input opponent.json
 tactixcore-code run soccer-player --team TEAM_ID --game GAME_ID --player PLAYER_ID --input player.json
+tactixcore-code pi --env-file "$TACTIXCORE_PLAYGROUND/.env" --skill soccer-ownteam \
+  --team TEAM_ID --game GAME_ID --analysis-input ownteam.json --prompt '指定の試合を分析して'
 ```
 
 `--input` は playground 内の JSON ファイルです。各 JSON の必須項目は [分析入力と成果物](docs/analysis-inputs.md) を参照してください。 `--dry-run` は入力、対象範囲、Python 環境を確認します。実行時は既存エンジン側で設定したモデルと認証を使います。OpenRouter のキーは分析子プロセスに継承しません。選手 Skill の強調トラックはコーチの本人確認が必要です。
+
+`pi --analysis-input` では、チーム・試合・入力を検証した後に Pi へスコープ固定のツールを1つだけ渡します。ツールはその分析を1回実行できます。OpenRouter に返すのは成功・失敗の状態で、レポートと根拠はローカルに残ります。
 
 ## 公開情報の検索
 

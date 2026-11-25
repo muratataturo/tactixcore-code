@@ -5,6 +5,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeAnalysis, planAnalysis } from '../src/analysis.mjs';
 import { fetchPublic, isPublicAddress, searchPublic } from '../src/web.mjs';
+import { runPi } from '../src/pi.mjs';
 
 function playground(t, skill, engine, family) {
   const dir = mkdtempSync(join(tmpdir(), 'playground-'));
@@ -51,6 +52,67 @@ test('own-team fixture preserves the report and evidence from the scoped adapter
   assert.equal(status, 0);
   assert.equal(output[0].evidence, 'engine/test-game_v001/evidence.json');
   assert.match(output[0].evidence_sha256, /^[a-f0-9]{64}$/);
+});
+
+test('Pi runs one pre-bound analysis and keeps its report out of the model transcript', async t => {
+  const skill = 'soccer-ownteam';
+  const { dir, file, scope } = playground(t, skill, 'ownteam_analysis_adk', 'ownanalysis');
+  for (const path of ['videos.json', 'detections.json', 'keypoints.json']) file(path, {});
+  file('input.json', {
+    ...scope, team_name: 'Private team fixture', items: 'items', videos: 'videos.json',
+    detections: 'detections.json', keypoints: 'keypoints.json'
+  });
+  const analysis = planAnalysis(skill, { playground: dir, team: scope.team_id, game: scope.game_id, input: 'input.json' });
+  const outputs = [];
+  const errors = [];
+  let calls = 0;
+  let engineRuns = 0;
+  let spans;
+  const status = await runPi({
+    skill, analysis, env: {}, key: 'unused-fixture-key', prompt: 'Run the selected analysis',
+    out: value => outputs.push(value), err: value => errors.push(value),
+    endpoint: 'http://127.0.0.1:4318/v1/traces',
+    fetchTrace: async (url, init) => {
+      spans = JSON.parse(init.body).resourceSpans[0].scopeSpans[0].spans;
+      return Response.json({});
+    },
+    analysisStart: async planned => {
+      engineRuns++;
+      mkdirSync(dirname(planned.artifact), { recursive: true });
+      writeFileSync(planned.artifact, 'Private report fixture');
+      writeFileSync(planned.evidence, '{}');
+      return 0;
+    },
+    fetchModel: async (url, init) => {
+      calls++;
+      assert.doesNotMatch(init.body, /Private team fixture|Private report fixture|tactixcore-run.json/);
+      const body = JSON.parse(init.body);
+      assert.equal(body.tool_choice, calls === 1 ? 'required' : 'none');
+      const toolName = 'run_scoped_soccer_analysis';
+      const finish = calls === 1 ? 'tool_calls' : 'stop';
+      const delta = calls === 1 ? {
+        role: 'assistant',
+        tool_calls: [{ index: 0, id: 'call_fixture', type: 'function',
+          function: { name: toolName, arguments: '{}' } }]
+      } : { role: 'assistant', content: 'Local analysis completed.' };
+      const base = { id: 'gen-fixture-' + calls, created: 1, object: 'chat.completion.chunk', model: 'openai/gpt-5-nano' };
+      const chunks = [
+        { ...base, choices: [{ index: 0, delta, finish_reason: null }] },
+        { ...base, choices: [{ index: 0, delta: {}, finish_reason: finish }] }
+      ];
+      return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n', {
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    }
+  });
+  assert.equal(status, 0, errors.join('\n'));
+  assert.equal(calls, 2);
+  assert.equal(engineRuns, 1);
+  assert.equal(outputs.length, 2);
+  assert.equal(JSON.parse(outputs[0]).skill_id, skill);
+  const agent = spans.find(span => span.name.startsWith('invoke_agent'));
+  assert.equal(spans.length, 4);
+  assert.ok(spans.filter(span => span !== agent).every(span => span.parentSpanId === agent.spanId));
 });
 
 test('player adapter requires a confirmed player and maps human annotation IDs deterministically', t => {

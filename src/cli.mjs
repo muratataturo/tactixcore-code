@@ -5,6 +5,7 @@ const help = `Usage
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
+  tactixcore-code pi --prompt TEXT --skill SKILL --playground PATH --team ID --game ID --analysis-input FILE
   tactixcore-code skills list
   tactixcore-code run SKILL --playground PATH --team ID --game ID --input FILE [--dry-run]
   tactixcore-code web-search --query PUBLIC_QUERY [--env-file PATH]
@@ -71,7 +72,9 @@ export async function main(args, {
         'env-file': { type: 'string' }, help: { type: 'boolean' },
         ...(command === 'pi' ? {
           prompt: { type: 'string' }, model: { type: 'string' }, stage: { type: 'string' }, skill: { type: 'string' },
-          'otlp-endpoint': { type: 'string' }
+          'otlp-endpoint': { type: 'string' }, 'analysis-input': { type: 'string' },
+          playground: { type: 'string' }, team: { type: 'string' }, game: { type: 'string' },
+          opponent: { type: 'string' }, player: { type: 'string' }
         } : {}),
         ...(command === 'web-search' ? { query: { type: 'string' } } : {}),
         ...(command === 'web-fetch' ? { url: { type: 'string' } } : {})
@@ -113,13 +116,21 @@ export async function main(args, {
     }
     try {
       const { runPi } = await import('./pi.mjs');
+      let analysis;
+      if (values['analysis-input'] !== undefined) {
+        const { planAnalysis } = await import('./analysis.mjs');
+        analysis = planAnalysis(values.skill, {
+          playground: values.playground ?? env.TACTIXCORE_PLAYGROUND, input: values['analysis-input'],
+          team: values.team, game: values.game, opponent: values.opponent, player: values.player
+        });
+      }
       return await runPi({
         key, prompt: values.prompt, model: values.model, stage: values.stage, skill: values.skill,
         endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-        out, err
+        analysis, env, out, err
       });
     } catch {
-      err('Pi could not complete the request. Check the model, stage, and configured endpoint.');
+      err('Pi could not complete the request. Check the model, endpoint, and any selected analysis inputs.');
       return 1;
     }
   }

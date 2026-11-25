@@ -3,8 +3,10 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
+import { Type } from 'typebox';
 import { Trace } from './telemetry.mjs';
 import { readBundledSkill } from './analysis-cli.mjs';
+import { executeAnalysis } from './analysis.mjs';
 
 const provider = 'tactixcore-openrouter';
 const origin = 'https://openrouter.ai/api/v1';
@@ -24,11 +26,11 @@ export function resolveRoute(model = 'agentrouter/auto', stage = 'triage') {
   return { ...route, id: model, stage };
 }
 
-function openRouterStream({ trace, parent, route, key, fetchModel }) {
-  let started = false;
+function openRouterStream({ trace, parent, route, key, fetchModel, analysis }) {
+  let requests = 0;
   return (model, context, options) => {
-    if (started) throw new Error('Pi request limit reached');
-    started = true;
+    const turn = ++requests;
+    if (turn > (analysis ? 2 : 1)) throw new Error('Pi request limit reached');
     const span = trace.start(`chat ${route.id}`, {
       parent, kind: 3, fields: {
         'gen_ai.operation.name': 'chat',
@@ -63,6 +65,7 @@ function openRouterStream({ trace, parent, route, key, fetchModel }) {
             ...enriched,
             model: route.id,
             provider: { data_collection: 'deny', require_parameters: true },
+            ...(analysis ? { tool_choice: turn === 1 ? 'required' : 'none' } : {}),
             ...(route.id === 'openrouter/auto' ? {
               plugins: [{ id: 'auto-router', allowed_models: route.models, cost_tier: route.tier }]
             } : {})
@@ -107,7 +110,7 @@ function openRouterStream({ trace, parent, route, key, fetchModel }) {
 
 export async function runPi({
   key, prompt, model, stage, skill, endpoint, out, err,
-  fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch
+  analysis, env = process.env, analysisStart, fetchModel = globalThis.fetch, fetchTrace = globalThis.fetch
 }) {
   const route = resolveRoute(model, stage);
   const guidance = skill ? readBundledSkill(skill) : null;
@@ -122,6 +125,8 @@ export async function runPi({
   const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
   let session;
   let failure;
+  let analysisState = 'not_started';
+  const toolName = 'run_scoped_soccer_analysis';
   try {
     const modelRuntime = await ModelRuntime.create({
       credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
@@ -129,7 +134,7 @@ export async function runPi({
     });
     modelRuntime.registerProvider(provider, {
       baseUrl: origin, api: 'openai-completions', apiKey: 'runtime-credential',
-      streamSimple: openRouterStream({ trace, parent: root, route, key, fetchModel }),
+      streamSimple: openRouterStream({ trace, parent: root, route, key, fetchModel, analysis }),
       models: [{
         id: route.id, name: route.id, input: ['text'],
         contextWindow: 16_384, maxTokens: 512, reasoning: false,
@@ -142,13 +147,32 @@ export async function runPi({
       noPromptTemplates: true, noThemes: true, noContextFiles: true,
       systemPrompt: [
         'You are TactixCore. Help with soccer questions. Say when evidence is missing.',
-        guidance
+        guidance,
+        analysis && 'The user authorized exactly one preconfigured analysis. Call run_scoped_soccer_analysis once, then report its status. The report contents are local.'
       ].filter(Boolean).join('\n\n')
     });
     await resourceLoader.reload();
+    const customTools = analysis ? [{
+      name: toolName, label: 'Scoped soccer analysis',
+      description: 'Run the user-selected soccer analysis on the exact prevalidated local inputs.',
+      parameters: Type.Object({}, { additionalProperties: false }),
+      execute: async (_id, params, signal) => {
+        if (analysisState !== 'not_started' || Object.keys(params).length !== 0) {
+          return { content: [{ type: 'text', text: 'Analysis was not run again. The tool accepts no arguments.' }], details: {} };
+        }
+        analysisState = 'running';
+        const status = await executeAnalysis(analysis, { trace, parent: root, env, out, err, signal, start: analysisStart });
+        analysisState = status === 0 ? 'completed' : 'failed';
+        return {
+          content: [{ type: 'text', text: status === 0 ? 'Local report generated.' : 'Local analysis failed.' }],
+          details: {}
+        };
+      }
+    }] : [];
     ({ session } = await createAgentSession({
       cwd, agentDir: cwd, modelRuntime, model: modelRuntime.getModel(provider, route.id),
-      settingsManager, sessionManager: SessionManager.inMemory(cwd), resourceLoader, tools: []
+      settingsManager, sessionManager: SessionManager.inMemory(cwd), resourceLoader,
+      tools: analysis ? [toolName] : [], customTools
     }));
     await session.prompt(prompt, { expandPromptTemplates: false });
     const answer = session.getLastAssistantText();
@@ -159,6 +183,10 @@ export async function runPi({
       return 1;
     }
     out(answer);
+    if (analysis && analysisState !== 'completed') {
+      failure = 'analysis_failed';
+      return 1;
+    }
     return 0;
   } catch {
     failure = 'agent_error';

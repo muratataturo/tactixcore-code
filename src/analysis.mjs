@@ -129,14 +129,14 @@ export function planAnalysis(skill, options) {
   };
 }
 
-function startEngine(plan, env, traceparent) {
+function startEngine(plan, env, traceparent, signal) {
   const allowed = ['PATH', 'HOME', 'LANG', 'TMPDIR', 'CLOUDSDK_CONFIG', 'GOOGLE_APPLICATION_CREDENTIALS',
     'GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'YOUTUBE_API_KEY'];
   const engineEnv = Object.fromEntries(allowed.filter(name => env[name]).map(name => [name, env[name]]));
   const pythonpath = [join(plan.engine, 'src'), plan.engine, join(plan.root, 'dataset_collector', 'common', 'src')].join(':');
   return new Promise((done, fail) => {
     const child = spawn(plan.python, plan.args, {
-      cwd: plan.root, stdio: 'ignore', env: {
+      cwd: plan.root, stdio: 'ignore', signal, env: {
         ...engineEnv, PYTHONPATH: pythonpath, TRACEPARENT: traceparent, PYTHONDONTWRITEBYTECODE: '1'
       }
     });
@@ -168,9 +168,10 @@ function allocateGeneration(plan) {
   throw new Error('Unable to reserve output generation');
 }
 
-export async function executeAnalysis(plan, { env, endpoint, out, err, start = startEngine }) {
-  const trace = new Trace(endpoint);
-  const root = trace.start('tactixcore.analysis', { fields: { 'tactixcore.skill.id': plan.skill } });
+export async function executeAnalysis(plan, {
+  env, endpoint, out, err, start = startEngine, signal, trace = new Trace(endpoint), parent
+}) {
+  const root = parent ?? trace.start('tactixcore.analysis', { fields: { 'tactixcore.skill.id': plan.skill } });
   const tool = trace.start(`execute_tool ${plan.skill}`, { parent: root, fields: {
     'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': plan.skill
   } });
@@ -185,7 +186,7 @@ export async function executeAnalysis(plan, { env, endpoint, out, err, start = s
       artifact: join(native, relative(':native-output:', plan.artifact)),
       evidence: join(native, relative(':native-output:', plan.evidence))
     };
-    const code = await start(plan, env, tool.traceparent);
+    const code = await start(plan, env, tool.traceparent, signal);
     if (code !== 0) throw new Error('Engine process failed');
     // Some opponent profiles publish the native enemy-report.html name.
     let report = plan.artifact;
@@ -218,7 +219,9 @@ export async function executeAnalysis(plan, { env, endpoint, out, err, start = s
     return 1;
   } finally {
     tool.end({}, error);
-    root.end({}, error);
-    if (!await trace.flush()) err('OTLP trace export failed.');
+    if (!parent) {
+      root.end({}, error);
+      if (!await trace.flush()) err('OTLP trace export failed.');
+    }
   }
 }
