@@ -1,0 +1,14 @@
+{
+  "name": "tactixcore-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bootstrap CLI for the TactixCore soccer analysis workspace",
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "bin": { "tactixcore-code": "bin/tactixcore-code.mjs" },
+  "files": ["bin/tactixcore-code.mjs", "src/cli.mjs"],
+  "scripts": {
+    "test": "node --test",
+    "check:public": "node scripts/check-public-tree.mjs"
+  }
+}

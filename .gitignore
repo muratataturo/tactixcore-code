@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+auth.json
+credentials.json
+*.pem
+*.p12
+*.key
+.pi/
+.tactixcore/
+artifacts/
+*.tgz
