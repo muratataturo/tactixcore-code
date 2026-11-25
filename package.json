@@ -6,7 +6,7 @@
   "type": "module",
   "engines": { "node": ">=22.19.0" },
   "bin": { "tactixcore-code": "bin/tactixcore-code.mjs" },
-  "files": ["bin/tactixcore-code.mjs", "src/*.mjs", "skills/*/SKILL.md"],
+  "files": ["bin/tactixcore-code.mjs", "src/*.mjs", "skills/*/SKILL.md", "assets/pomeranian.png", "assets/pomeranian.rgb"],
   "dependencies": {
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.4.0",

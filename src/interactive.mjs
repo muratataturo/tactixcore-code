@@ -5,6 +5,7 @@ import {
   createAgentSessionRuntime, createAgentSessionServices, createAgentSessionFromServices,
   InteractiveMode, initTheme, SessionManager, SettingsManager
 } from '@earendil-works/pi-coding-agent';
+import { getCapabilities } from '@earendil-works/pi-tui';
 import { bundledSkills, readBundledSkill } from './analysis-cli.mjs';
 import { createOpenRouterRuntime, openRouterStream, resolveRoute } from './pi.mjs';
 import { Trace } from './telemetry.mjs';
@@ -79,7 +80,11 @@ export async function openInteractivePi({ key, envFile, model, stage, skill, end
   }, { cwd, agentDir, sessionManager: SessionManager.inMemory(cwd) });
   initTheme(settingsManager.getTheme());
   try {
-    await new InteractiveMode(runtime, { startupDiagnostics: runtime.diagnostics }).run();
+    await new InteractiveMode(runtime, {
+      startupDiagnostics: runtime.diagnostics,
+      // Pi disables the iTerm2 graphics protocol in its alternate-screen renderer.
+      tuiMode: getCapabilities().images === 'iterm2' ? 'regular' : undefined
+    }).run();
   } finally {
     await runtime.dispose();
   }

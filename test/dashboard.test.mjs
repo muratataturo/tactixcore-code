@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { visibleWidth } from '@earendil-works/pi-tui';
+import { resetCapabilitiesCache, setCapabilities, visibleWidth } from '@earendil-works/pi-tui';
 import { renderDashboardHeader, renderDashboardFooter, usageDetails } from '../src/dashboard.mjs';
+import { createMascotImage } from '../src/pomeranian-logo.mjs';
 import { createUsageLedger, formatCount, formatUsd } from '../src/usage.mjs';
 
 const theme = { fg: (_color, value) => value, bold: value => value };
@@ -33,7 +34,7 @@ test('usage ledger sums provider figures and marks unreported values', () => {
   assert.match(usageDetails(totals, 'openrouter/auto').join('\n'), /100\+ included in input/);
 });
 
-test('pixel header and usage stay within normal and narrow terminal widths', () => {
+test('thumbnail header and usage stay within normal and narrow terminal widths', () => {
   const state = createUsageLedger().snapshot();
   for (const width of [24, 40, 66, 80, 120]) {
     const header = renderDashboardHeader(width, 35, theme);
@@ -49,4 +50,15 @@ test('pixel header and usage stay within normal and narrow terminal widths', () 
     assert.match(footer.join('\n'), /Session \$0\.00/);
   }
   assert.ok(renderDashboardHeader(80, 19, theme).every(line => !line.includes('▀')));
+});
+
+test('image-capable terminals receive the PNG through their native protocol', t => {
+  t.after(() => resetCapabilitiesCache());
+  for (const [protocol, prefix] of [['kitty', '\x1b_G'], ['iterm2', '\x1b]1337;File=']]) {
+    setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
+    const image = createMascotImage(theme, 12);
+    const lines = renderDashboardHeader(80, 35, theme, image);
+    assert.ok(lines.some(line => line.includes(prefix)));
+    assert.ok(lines.every(line => !line.includes('▀')));
+  }
 });

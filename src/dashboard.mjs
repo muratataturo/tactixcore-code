@@ -1,9 +1,8 @@
 import { basename } from 'node:path';
-import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
-import { pomeranianLogo } from './pomeranian-logo.mjs';
+import { getCapabilities, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { createMascotImage, renderMascotThumbnail } from './pomeranian-logo.mjs';
 import { formatCount, formatUsd } from './usage.mjs';
 
-const art = pomeranianLogo();
 const dot = '  ·  ';
 const text = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
 
@@ -26,12 +25,14 @@ function rows(items, width) {
   return fit(lines, width);
 }
 
-export function renderDashboardHeader(width, height, theme) {
+export function renderDashboardHeader(width, height, theme, image) {
   const title = theme.fg('accent', theme.bold('TactixCore Code'));
   const context = theme.fg('muted', 'Pi  /  OpenRouter');
   const shortcuts = theme.fg('dim', '/usage   /skill:   Ctrl+D');
   if (width < 40 || height < 22) return fit([title, shortcuts], width);
-  if (width < 70) return [...art, ...fit([title + '  ' + context, shortcuts], width), ''];
+  if (image) return [...fit([title + '  ' + context, shortcuts], width), ...image.render(width), ''];
+  const art = renderMascotThumbnail(height < 28 ? 28 : Math.min(44, width));
+  if (width < 76) return [...art, ...fit([title + '  ' + context, shortcuts], width), ''];
   const labels = new Map([[2, title], [3, context], [6, shortcuts]]);
   return [...art.map((line, index) => truncateToWidth(line + '    ' + (labels.get(index) ?? ''), width)), ''];
 }
@@ -83,10 +84,23 @@ export function dashboardExtension(ledger) {
   return pi => {
     pi.on('session_start', (_event, ctx) => {
       if (!ctx.hasUI) return;
-      ctx.ui.setHeader((tui, theme) => ({
-        render: width => renderDashboardHeader(width, tui.terminal.rows, theme),
-        invalidate() {}
-      }));
+      ctx.ui.setHeader((tui, theme) => {
+        let compact;
+        let full;
+        return {
+          render(width) {
+            const height = tui.terminal.rows;
+            let image;
+            if (width >= 40 && height >= 22 && getCapabilities().images) {
+              image = height < 28
+                ? (compact ??= createMascotImage(theme, 8))
+                : (full ??= createMascotImage(theme, 12));
+            }
+            return renderDashboardHeader(width, height, theme, image);
+          },
+          invalidate() { compact?.invalidate(); full?.invalidate(); }
+        };
+      });
       ctx.ui.setFooter((tui, theme, data) => {
         const removeUsage = ledger.subscribe(() => tui.requestRender());
         const removeBranch = data.onBranchChange(() => tui.requestRender());
