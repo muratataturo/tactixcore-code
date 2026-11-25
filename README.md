@@ -1,0 +1,2 @@
+# tactixcore-code
+サッカーのためのcoding agent
