@@ -937,8 +937,16 @@ export class StudioDataManager {
           written += chunk.length;
           if (!writer.write(chunk)) {
             await new Promise((resDrain, rejDrain) => {
-              writer.once('drain', resDrain);
-              writer.once('error', rejDrain);
+              const onDrain = () => {
+                writer.off('error', onError);
+                resDrain();
+              };
+              const onError = err => {
+                writer.off('drain', onDrain);
+                rejDrain(err);
+              };
+              writer.once('drain', onDrain);
+              writer.once('error', onError);
             });
           }
           const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
@@ -952,10 +960,20 @@ export class StudioDataManager {
           if (res.status === 200) break;
         }
       } finally {
-        await new Promise((resEnd, rejEnd) => {
-          writer.once('error', rejEnd);
-          writer.end(resEnd);
-        });
+        if (!writer.destroyed && !writer.errored) {
+          await new Promise((resEnd, rejEnd) => {
+            const onFinish = () => {
+              writer.off('error', onError);
+              resEnd();
+            };
+            const onError = err => {
+              writer.off('finish', onFinish);
+              rejEnd(err);
+            };
+            writer.once('error', onError);
+            writer.end(onFinish);
+          });
+        }
       }
       const actualHash = hasher.digest('hex');
       if (written !== info.size_bytes) throw new Error(`Video size mismatch: expected=${info.size_bytes}, actual=${written}`);

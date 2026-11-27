@@ -27,8 +27,10 @@ function verifyDpop(proof, method, expectedUrl, expectedJwk, expectedToken = nul
   }
 }
 
-async function startMockStudio() {
-  const videoBytes = Buffer.from('MOCK_VIDEO_BYTES_'.repeat(2500));
+async function startMockStudio({ videoSizeBytes = null } = {}) {
+  const videoBytes = videoSizeBytes
+    ? Buffer.alloc(videoSizeBytes, 0x61)
+    : Buffer.from('MOCK_VIDEO_BYTES_'.repeat(2500));
   const videoSha = createHash('sha256').update(videoBytes).digest('hex');
   const requests = new Map();
   const codes = new Map();
@@ -123,7 +125,7 @@ test('standalone tactixcore-code CLI supports --version and studio commands from
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const outputs = [];
   assert.equal(await main(['--version'], { out: s => outputs.push(s), err: () => {} }), 0);
-  assert.match(outputs[0], /^tactixcore-code 0\.4\.0/);
+  assert.match(outputs[0], /^tactixcore-code 0\.4\.1/);
 
   const statusOut = [];
   assert.equal(await main(['studio', 'status', '--environment', 'dev'], {
@@ -284,4 +286,38 @@ test('progress formatting and stderr terminal reporting keep stdout clean JSON',
   assert.equal(codeQuiet, 0);
   assert.equal(JSON.parse(quietStdout.join('')).videos[0].source, 'cache');
   assert.equal(quietStderr.length, 0);
+});
+
+test('multi-chunk video download (>10 chunks) cleans up WriteStream error listeners without MaxListenersExceededWarning', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-code-studio-multichunk-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // 16 chunks of 64 KiB (minimum chunkBytes in ensureVideoFile) -> exceeds default 10-listener limit if leaked
+  const mock = await startMockStudio({ videoSizeBytes: 16 * 64 * 1024 });
+  t.after(mock.close);
+
+  const warnings = [];
+  const onWarning = w => warnings.push(w);
+  process.on('warning', onWarning);
+  t.after(() => process.off('warning', onWarning));
+
+  const manager = new StudioDataManager(dir, {
+    async openBrowser(authUri) {
+      const r = await fetch(authUri, { redirect: 'manual' });
+      await fetch(r.headers.get('location'));
+    }
+  });
+  await manager.oauth.login({ environment: 'dev', origin: mock.origin });
+
+  const res = await manager.ensureVideoFile({
+    environment: 'dev',
+    origin: mock.origin,
+    team_id: 'team_a',
+    game_id: 'm1',
+    video_id: 'v1'
+  });
+  assert.equal(res.source, 'remote');
+  assert.equal(res.sha256, mock.videoSha);
+  assert.equal(mock.getMediaCalls(), 16);
+  const maxListenerWarnings = warnings.filter(w => w.name === 'MaxListenersExceededWarning');
+  assert.equal(maxListenerWarnings.length, 0);
 });
