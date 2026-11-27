@@ -1,12 +1,16 @@
-import { constants, openSync, closeSync, fstatSync, readSync } from 'node:fs';
+import { constants, openSync, closeSync, fstatSync, readFileSync, readSync } from 'node:fs';
 import { parseArgs, parseEnv } from 'node:util';
 import { profileDirectory, saveEnvFile, selectEnvFile } from './profile.mjs';
 
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
 const help = `Usage
   tactixcore-code [--resume SESSION_ID] [--env-file PATH] [--model MODEL] [--max-output-tokens N] [--no-session] [--no-parallel]
+  tactixcore-code --version
   tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
+  tactixcore-code studio login|status|logout|workspaces|videos|annotations|fetch|cache|clean [--environment dev|prd]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
   tactixcore-code pi --prompt TEXT --skill SKILL --playground PATH --team ID --game ID --analysis-input FILE
   tactixcore-code skills list
@@ -53,6 +57,10 @@ export async function main(args, {
   isTerminal = process.stdin.isTTY && process.stdout.isTTY
 } = {}) {
   const first = args[0];
+  if (first === '--version' || first === '-v' || first === 'version') {
+    out(`${pkg.name} ${pkg.version} (pi ${pkg.dependencies['@earendil-works/pi-coding-agent']})`);
+    return 0;
+  }
   if (first === '--help' || first === 'help') {
     out(help);
     return 0;
@@ -60,6 +68,10 @@ export async function main(args, {
   const defaultCommand = first === undefined || first.startsWith('--');
   const command = defaultCommand ? 'pi' : first;
   const flags = defaultCommand ? args : args.slice(1);
+  if (command === 'studio') {
+    const { runStudioCommand } = await import('./studio-mcp.mjs');
+    return runStudioCommand(flags, { profile: profileDirectory(env), out, err });
+  }
   if (command === 'sessions') {
     const { runSessionsCommand } = await import('./sessions.mjs');
     return runSessionsCommand(flags, { profile: profileDirectory(env), out, err });
