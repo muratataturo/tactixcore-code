@@ -6,7 +6,10 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../src/cli.mjs';
-import { createStudioTool, StudioDataManager, studioExtension } from '../src/studio-mcp.mjs';
+import {
+  createStudioTool, createTerminalProgressReporter, formatBytes, formatDuration,
+  formatProgressLine, renderProgressBar, StudioDataManager, studioExtension
+} from '../src/studio-mcp.mjs';
 
 function verifyDpop(proof, method, expectedUrl, expectedJwk, expectedToken = null) {
   const [a, b, c] = proof.split('.');
@@ -120,7 +123,7 @@ test('standalone tactixcore-code CLI supports --version and studio commands from
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const outputs = [];
   assert.equal(await main(['--version'], { out: s => outputs.push(s), err: () => {} }), 0);
-  assert.match(outputs[0], /^tactixcore-code 0\.3\.0/);
+  assert.match(outputs[0], /^tactixcore-code 0\.4\.0/);
 
   const statusOut = [];
   assert.equal(await main(['studio', 'status', '--environment', 'dev'], {
@@ -181,4 +184,104 @@ test('StudioDataManager, studio_mcp tool, and /studio extension handle OAuth, ca
   assert.equal(existsSync(refetched.path), false);
 
   await runTool({ action: 'logout', environment: 'dev', origin: mock.origin });
+});
+
+test('progress formatting and stderr terminal reporting keep stdout clean JSON', async t => {
+  assert.equal(formatBytes(0), '0 B');
+  assert.equal(formatBytes(1536), '1.50 KiB');
+  assert.equal(formatBytes(3 * 1024 * 1024 * 1024), '3.00 GiB');
+  assert.equal(formatDuration(45), '45s');
+  assert.equal(formatDuration(125), '2m05s');
+  assert.equal(formatDuration(3665), '1h01m');
+  assert.equal(renderProgressBar(50, 10), '[█████░░░░░]');
+
+  const dlLine = formatProgressLine({
+    phase: 'download',
+    prefix: 'video 1/1',
+    filename: 'veo.mp4',
+    completed: 512 * 1024 * 1024,
+    total: 1024 * 1024 * 1024,
+    bytesPerSec: 16 * 1024 * 1024,
+    etaSec: 32
+  });
+  assert.match(dlLine, /\[studio\] video 1\/1 \[██████████░░░░░░░░░░\]  50\.0%/);
+  assert.match(dlLine, /ETA 32s/);
+  assert.match(dlLine, /veo\.mp4/);
+
+  // TTY reporter writes inline ANSI updates and clears on finish
+  const ttyWrites = [];
+  const ttyReporter = createTerminalProgressReporter({
+    stream: { isTTY: true, write: s => ttyWrites.push(s) }
+  });
+  ttyReporter.report({ phase: 'download', prefix: 'video 1/1', filename: 'a.mp4', completed: 10, total: 100 });
+  ttyReporter.finish();
+  assert.ok(ttyWrites.some(w => w.includes('\r\x1b[2K')));
+  assert.equal(ttyWrites.at(-1), '\n');
+
+  // Non-TTY reporter emits newline-delimited lines; quiet reporter emits nothing
+  const pipeWrites = [];
+  const pipeReporter = createTerminalProgressReporter({
+    stream: { isTTY: false, write: s => pipeWrites.push(s) }
+  });
+  pipeReporter.report({ phase: 'step', message: '[1/2] metadata: fetching' });
+  pipeReporter.finish();
+  assert.equal(pipeWrites.length, 1);
+  assert.match(pipeWrites[0], /^\[studio\] \[1\/2\] metadata: fetching\n$/);
+
+  const quietWrites = [];
+  const quietReporter = createTerminalProgressReporter({
+    quiet: true,
+    stream: { isTTY: false, write: s => quietWrites.push(s) }
+  });
+  quietReporter.report({ phase: 'step', message: '[1/2] metadata' });
+  quietReporter.finish();
+  assert.equal(quietWrites.length, 0);
+
+  // End-to-end fetch with progressStream -> stderr gets progress, stdout stays pure JSON
+  const dir = mkdtempSync(join(tmpdir(), 'tc-code-studio-progress-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const mock = await startMockStudio();
+  t.after(mock.close);
+
+  const manager = new StudioDataManager(dir, {
+    async openBrowser(authUri) {
+      const r = await fetch(authUri, { redirect: 'manual' });
+      await fetch(r.headers.get('location'));
+    }
+  });
+  await manager.oauth.login({ environment: 'dev', origin: mock.origin });
+
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  const { runStudioCommand } = await import('../src/studio-mcp.mjs');
+  const code = await runStudioCommand(
+    ['fetch', '--team', 'team_a', '--game', 'm1', '--environment', 'dev', '--origin', mock.origin],
+    {
+      profile: dir,
+      out: s => stdoutChunks.push(s),
+      err: () => {},
+      progressStream: { isTTY: false, write: s => stderrChunks.push(s) }
+    }
+  );
+  assert.equal(code, 0);
+  const parsed = JSON.parse(stdoutChunks.join(''));
+  assert.equal(parsed.videos[0].source, 'remote');
+  assert.ok(stderrChunks.some(s => s.includes('[studio]')));
+  assert.ok(stderrChunks.some(s => s.includes(' done ')));
+
+  // --quiet suppresses stderr progress
+  const quietStdout = [];
+  const quietStderr = [];
+  const codeQuiet = await runStudioCommand(
+    ['fetch', '--team', 'team_a', '--game', 'm1', '--environment', 'dev', '--origin', mock.origin, '--quiet'],
+    {
+      profile: dir,
+      out: s => quietStdout.push(s),
+      err: () => {},
+      progressStream: { isTTY: false, write: s => quietStderr.push(s) }
+    }
+  );
+  assert.equal(codeQuiet, 0);
+  assert.equal(JSON.parse(quietStdout.join('')).videos[0].source, 'cache');
+  assert.equal(quietStderr.length, 0);
 });

@@ -35,13 +35,133 @@ function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-async function sha256File(filePath) {
+export function formatBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n < 1024) return `${Math.max(0, Math.round(n))} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let value = n / 1024;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx++;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[idx]}`;
+}
+
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--';
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return `${m}m${String(remS).padStart(2, '0')}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h${String(remM).padStart(2, '0')}m`;
+}
+
+export function renderProgressBar(percent, width = 20) {
+  const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+  const filled = Math.round((clamped / 100) * width);
+  return `[${'█'.repeat(filled)}${'░'.repeat(Math.max(0, width - filled))}]`;
+}
+
+export function formatProgressLine(event) {
+  if (!event || typeof event !== 'object') return '';
+  if (event.phase === 'download' || event.phase === 'verify_cache') {
+    const pct = event.total > 0 ? Math.min(100, (event.completed / event.total) * 100) : 0;
+    const bar = renderProgressBar(pct, 20);
+    const speed = event.bytesPerSec > 0 ? ` ${formatBytes(event.bytesPerSec)}/s` : '';
+    const eta = event.done ? ' done' : (event.etaSec !== null && event.etaSec !== undefined ? ` ETA ${formatDuration(event.etaSec)}` : '');
+    const prefix = event.phase === 'verify_cache' ? 'verifying cache' : (event.prefix || 'downloading');
+    const name = event.filename ? ` ${event.filename}` : '';
+    return `[studio] ${prefix} ${bar} ${pct.toFixed(1).padStart(5, ' ')}% ${formatBytes(event.completed)}/${formatBytes(event.total)}${speed}${eta}${name}`;
+  }
+  return `[studio] ${event.message || event.phase || 'working...'}`;
+}
+
+export function createTerminalProgressReporter({ stream = process.stderr, quiet = false, isTTY = null } = {}) {
+  if (quiet || !stream || typeof stream.write !== 'function') {
+    return { report() {}, finish() {} };
+  }
+  const tty = isTTY !== null ? Boolean(isTTY) : Boolean(stream.isTTY);
+  let activeInline = false;
+  let lastNonTtyAt = 0;
+  let lastNonTtyPct = -10;
+
+  const clearInline = () => {
+    if (tty && activeInline) {
+      stream.write('\r\x1b[2K');
+      activeInline = false;
+    }
+  };
+
+  return {
+    report(event) {
+      const line = formatProgressLine(event);
+      if (!line) return;
+      const isTransfer = event.phase === 'download' || event.phase === 'verify_cache';
+      if (isTransfer && !event.done) {
+        if (tty) {
+          stream.write(`\r\x1b[2K${line}`);
+          activeInline = true;
+        } else {
+          const now = Date.now();
+          const pct = event.total > 0 ? (event.completed / event.total) * 100 : 0;
+          if (now - lastNonTtyAt >= 2000 || pct - lastNonTtyPct >= 10 || event.completed === 0) {
+            stream.write(`${line}\n`);
+            lastNonTtyAt = now;
+            lastNonTtyPct = pct;
+          }
+        }
+        return;
+      }
+      clearInline();
+      stream.write(`${line}\n`);
+      if (isTransfer && event.done) {
+        lastNonTtyAt = 0;
+        lastNonTtyPct = -10;
+      }
+    },
+    finish() {
+      if (tty && activeInline) {
+        stream.write('\n');
+        activeInline = false;
+      }
+    }
+  };
+}
+
+async function sha256File(filePath, { totalBytes = null, onProgress = null, filename = '' } = {}) {
   return new Promise((resolveHash, rejectHash) => {
     const hash = createHash('sha256');
+    const total = totalBytes ?? (() => { try { return lstatSync(filePath).size; } catch { return 0; } })();
+    const startedAt = Date.now();
+    let completed = 0;
+    let lastEmit = 0;
     const stream = createReadStream(filePath);
-    stream.on('data', chunk => hash.update(chunk));
+    stream.on('data', chunk => {
+      hash.update(chunk);
+      completed += chunk.length;
+      if (onProgress && total > 0) {
+        const now = Date.now();
+        if (now - lastEmit >= 200) {
+          const elapsedSec = Math.max(0.001, (now - startedAt) / 1000);
+          const bytesPerSec = completed / elapsedSec;
+          const etaSec = bytesPerSec > 0 ? (total - completed) / bytesPerSec : null;
+          onProgress({ phase: 'verify_cache', completed, total, bytesPerSec, etaSec, filename, done: false });
+          lastEmit = now;
+        }
+      }
+    });
     stream.on('error', rejectHash);
-    stream.on('end', () => resolveHash(hash.digest('hex')));
+    stream.on('end', () => {
+      if (onProgress && total > 0) {
+        const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
+        onProgress({ phase: 'verify_cache', completed: total, total, bytesPerSec: total / elapsedSec, etaSec: 0, filename, done: true });
+      }
+      resolveHash(hash.digest('hex'));
+    });
   });
 }
 
@@ -220,7 +340,7 @@ export class StudioOAuthClient {
     };
   }
 
-  async login({ environment = 'dev', origin, scopes = DEFAULT_SCOPES, timeoutMs = 180_000, openBrowser } = {}) {
+  async login({ environment = 'dev', origin, scopes = DEFAULT_SCOPES, timeoutMs = 180_000, openBrowser, onProgress = null } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
     const device = createEd25519DeviceKey();
     const verifier = b64url(randomBytes(48));
@@ -289,8 +409,21 @@ export class StudioOAuthClient {
         throw new Error('Studio OAuth authorization_uri missing');
       }
       const opener = openBrowser || this.openBrowser;
+      onProgress?.({ phase: 'oauth', message: `OAuth ログイン開始 (${resolvedOrigin}) — ブラウザで認証を完了してください...` });
       await opener(enrollment.authorization_uri, { redirect_uri: redirectUri, state });
-      const code = await callbackPromise;
+      const waitStarted = Date.now();
+      const waitTicker = onProgress ? setInterval(() => {
+        const remainSec = Math.max(0, Math.round((timeoutMs - (Date.now() - waitStarted)) / 1000));
+        onProgress({ phase: 'oauth', message: `ブラウザでの OAuth 承認を待機中... (残り ${formatDuration(remainSec)})` });
+      }, 15_000) : null;
+      waitTicker?.unref?.();
+      let code;
+      try {
+        code = await callbackPromise;
+      } finally {
+        if (waitTicker) clearInterval(waitTicker);
+      }
+      onProgress?.({ phase: 'oauth', message: '認可コード受信 — DPoP トークンを発行中...' });
 
       const tokenUrl = `${resolvedOrigin}/auth/token`;
       const proof = createDpopProof(device, 'POST', tokenUrl);
@@ -729,7 +862,7 @@ export class StudioDataManager {
     };
   }
 
-  async ensureVideoFile({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, asset_id, force_refresh = false, verify_hash = true, signal } = {}) {
+  async ensureVideoFile({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, asset_id, force_refresh = false, verify_hash = true, signal, onProgress = null, videoIndex = null, videoTotal = null } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
     const gid = game_id || workspace_id;
     safeId(team_id, 'team_id');
@@ -747,10 +880,15 @@ export class StudioDataManager {
     );
 
     if (!force_refresh && cachedEntry && this._isPresentFile(cachedEntry.path, cachedEntry.size_bytes)) {
-      const hashOk = !verify_hash || (await sha256File(cachedEntry.path)) === cachedEntry.sha256;
+      const hashOk = !verify_hash || (await sha256File(cachedEntry.path, {
+        totalBytes: cachedEntry.size_bytes,
+        onProgress,
+        filename: cachedEntry.filename || cachedEntry.asset_id
+      })) === cachedEntry.sha256;
       if (hashOk) {
         cachedEntry.last_accessed_at = new Date().toISOString();
         this._writeIndex(index);
+        onProgress?.({ phase: 'video_cache', message: `動画キャッシュ再利用: ${cachedEntry.filename || cachedEntry.asset_id} (${formatBytes(cachedEntry.size_bytes)})` });
         return {
           source: 'cache', refetched_missing: false, path: cachedEntry.path, team_id, game_id: gid, workspace_id: gid,
           video_id: cachedEntry.video_id, asset_id: cachedEntry.asset_id, filename: cachedEntry.filename,
@@ -760,6 +898,7 @@ export class StudioDataManager {
     }
 
     const refetchedMissing = Boolean(cachedEntry && !this._isPresentFile(cachedEntry.path));
+    onProgress?.({ phase: 'download_info', message: `動画ダウンロード情報を取得中 (${video_id || asset_id})...` });
     const info = await this.mcp.getVideoDownloadInfo(resolvedOrigin, { team_id, game_id: gid, account_id, video_id, asset_id, signal });
     const rawExt = extname(info.filename || '').toLowerCase();
     const safeExt = /^\.[a-z0-9]{1,8}$/.test(rawExt) ? rawExt : '.mp4';
@@ -769,7 +908,15 @@ export class StudioDataManager {
     const partPath = `${filePath}.${randomBytes(6).toString('hex')}.part`;
     const chunkBytes = Math.max(64 * 1024, Number(info.chunk_bytes || 8 * 1024 * 1024));
     const hasher = createHash('sha256');
+    const startedAt = Date.now();
+    const prefix = videoIndex && videoTotal ? `video ${videoIndex}/${videoTotal}` : 'downloading';
+    const displayName = info.filename || `${info.asset_id}${safeExt}`;
     let written = 0;
+
+    onProgress?.({
+      phase: 'download', prefix, completed: 0, total: info.size_bytes,
+      bytesPerSec: 0, etaSec: null, filename: displayName, done: false
+    });
 
     try {
       const writer = createWriteStream(partPath, { mode: 0o600 });
@@ -794,6 +941,14 @@ export class StudioDataManager {
               writer.once('error', rejDrain);
             });
           }
+          const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
+          const bytesPerSec = written / elapsedSec;
+          const remaining = Math.max(0, info.size_bytes - written);
+          const etaSec = bytesPerSec > 0 ? remaining / bytesPerSec : null;
+          onProgress?.({
+            phase: 'download', prefix, completed: written, total: info.size_bytes,
+            bytesPerSec, etaSec, filename: displayName, done: false
+          });
           if (res.status === 200) break;
         }
       } finally {
@@ -806,6 +961,11 @@ export class StudioDataManager {
       if (written !== info.size_bytes) throw new Error(`Video size mismatch: expected=${info.size_bytes}, actual=${written}`);
       if (actualHash !== info.sha256) throw new Error(`Video SHA-256 mismatch: expected=${info.sha256}, actual=${actualHash}`);
       renameSync(partPath, filePath);
+      const totalElapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
+      onProgress?.({
+        phase: 'download', prefix, completed: written, total: info.size_bytes,
+        bytesPerSec: written / totalElapsedSec, etaSec: 0, filename: displayName, done: true
+      });
     } catch (error) {
       try { unlinkSync(partPath); } catch { /* ignore */ }
       throw error;
@@ -827,15 +987,26 @@ export class StudioDataManager {
     };
   }
 
-  async ensureMatchData({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, include_video = true, force_refresh = false, signal } = {}) {
+  async ensureMatchData({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, include_video = true, force_refresh = false, signal, onProgress = null } = {}) {
     const gid = game_id || workspace_id;
+    const totalSteps = include_video ? 3 : 2;
+    onProgress?.({ phase: 'metadata', message: `[1/${totalSteps}] 動画メタデータを取得中 (${team_id}/${gid})...` });
     const metadata = await this.ensureVideoMetadata({ environment, origin, team_id, game_id: gid, account_id, video_id, force_refresh, signal });
+    onProgress?.({ phase: 'metadata', message: `[1/${totalSteps}] メタデータ完了 (${metadata.source}, 動画 ${metadata.data.count ?? (metadata.data.videos || []).length}本)` });
+
+    onProgress?.({ phase: 'annotations', message: `[2/${totalSteps}] トランジション注釈を取得中 (${team_id}/${gid})...` });
     const annotations = await this.ensureTransitionAnnotations({ environment, origin, team_id, game_id: gid, account_id, video_id, force_refresh, signal });
+    onProgress?.({ phase: 'annotations', message: `[2/${totalSteps}] 注釈完了 (${annotations.source}, ${annotations.data.count ?? 0}件)` });
+
     const videos = [];
     if (include_video) {
-      for (const v of metadata.data.videos || []) {
+      const list = metadata.data.videos || [];
+      onProgress?.({ phase: 'videos', message: `[3/${totalSteps}] 動画ファイルを確認・取得中 (${list.length}本)...` });
+      for (let i = 0; i < list.length; i++) {
+        const v = list[i];
         videos.push(await this.ensureVideoFile({
-          environment, origin, team_id, game_id: gid, account_id, video_id: v.id, asset_id: v.asset_id, force_refresh, signal
+          environment, origin, team_id, game_id: gid, account_id, video_id: v.id, asset_id: v.asset_id,
+          force_refresh, signal, onProgress, videoIndex: i + 1, videoTotal: list.length
         }));
       }
     }
@@ -977,12 +1148,21 @@ export function createStudioTool(manager) {
       max_bytes: Type.Optional(Type.Number()),
       dry_run: Type.Optional(Type.Boolean())
     }, { additionalProperties: false }),
-    async execute(_id, args, signal) {
+    async execute(_id, args, signal, onUpdate) {
       const env = args.environment || 'dev';
       const gid = args.game_id || args.workspace_id;
+      let lastUpdate = 0;
+      const onProgress = typeof onUpdate === 'function' ? event => {
+        const now = Date.now();
+        if (!event.done && (event.phase === 'download' || event.phase === 'verify_cache') && now - lastUpdate < 1000) return;
+        lastUpdate = now;
+        try {
+          onUpdate({ content: [{ type: 'text', text: formatProgressLine(event) }], details: { progress: event } });
+        } catch { /* ignore UI update errors */ }
+      } : null;
       let result;
       if (args.action === 'status') result = manager.status({ environment: env, origin: args.origin });
-      else if (args.action === 'login') result = await manager.login({ environment: env, origin: args.origin });
+      else if (args.action === 'login') result = await manager.login({ environment: env, origin: args.origin, onProgress });
       else if (args.action === 'logout') result = await manager.logout({ environment: env, origin: args.origin });
       else if (args.action === 'teams') result = await manager.listTeams({ environment: env, origin: args.origin, account_id: args.account_id, signal });
       else if (args.action === 'games') result = await manager.listGames({ environment: env, origin: args.origin, team_id: args.team_id, account_id: args.account_id, signal });
@@ -990,8 +1170,8 @@ export function createStudioTool(manager) {
       else if (args.action === 'videos') result = await manager.ensureVideoMetadata({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
       else if (args.action === 'annotations') result = await manager.ensureTransitionAnnotations({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
       else if (args.action === 'results') result = await manager.ensureAnalysisResults({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'ensure_video') result = await manager.ensureVideoFile({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, asset_id: args.asset_id, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'ensure_match') result = await manager.ensureMatchData({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, include_video: args.include_video !== false, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'ensure_video') result = await manager.ensureVideoFile({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, asset_id: args.asset_id, force_refresh: Boolean(args.force_refresh), signal, onProgress });
+      else if (args.action === 'ensure_match') result = await manager.ensureMatchData({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, include_video: args.include_video !== false, force_refresh: Boolean(args.force_refresh), signal, onProgress });
       else if (args.action === 'cache_status') result = manager.cacheStatus({ team_id: args.team_id, game_id: gid });
       else if (args.action === 'clean') result = manager.clean({ all: Boolean(args.all), videos_only: Boolean(args.videos_only), team_id: args.team_id, game_id: gid, max_age_hours: args.max_age_hours, max_bytes: args.max_bytes, dry_run: Boolean(args.dry_run) });
       else throw new Error('Unknown studio_mcp action');
@@ -1048,7 +1228,24 @@ export function studioExtension(manager) {
             const include_video = !parts.includes('--no-video');
             const force_refresh = parts.includes('--refresh');
             ctx.ui.notify(`Fetching Studio data (${team_id}/${game_id})...`, 'info');
-            const res = await manager.ensureMatchData({ environment: env, team_id, game_id, video_id, include_video, force_refresh });
+            let lastBucket = -1;
+            const onProgress = event => {
+              const line = formatProgressLine(event);
+              ctx.ui.setStatus?.('studio', line);
+              if ((event.phase === 'download' || event.phase === 'verify_cache') && event.total > 0) {
+                const bucket = Math.floor((event.completed / event.total) * 4); // 0%, 25%, 50%, 75%, 100%
+                if (event.done || bucket > lastBucket) {
+                  lastBucket = bucket;
+                  ctx.ui.notify(line, 'info');
+                }
+              }
+            };
+            let res;
+            try {
+              res = await manager.ensureMatchData({ environment: env, team_id, game_id, video_id, include_video, force_refresh, onProgress });
+            } finally {
+              ctx.ui.setStatus?.('studio', '');
+            }
             ctx.ui.notify(`Fetched ${team_id}/${game_id}: metadata(${res.video_metadata.source}), annotations(${res.annotations.source}, ${res.annotations.count}件), videos(${res.videos.length}本)`, 'info');
             return;
           }
@@ -1072,7 +1269,7 @@ export function studioExtension(manager) {
   };
 }
 
-export async function runStudioCommand(flags, { profile, out = console.log, err = console.error, manager = null } = {}) {
+export async function runStudioCommand(flags, { profile, out = console.log, err = console.error, manager = null, progressStream = process.stderr } = {}) {
   const studio = manager || new StudioDataManager(profile);
   const action = flags[0] && !flags[0].startsWith('--') ? flags[0] : 'status';
   const rest = flags[0] && !flags[0].startsWith('--') ? flags.slice(1) : flags;
@@ -1096,34 +1293,43 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
         all: { type: 'boolean', default: false },
         'videos-only': { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
+        quiet: { type: 'boolean', default: false },
         help: { type: 'boolean', default: false }
       }
     }));
   } catch {
-    err('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run]');
+    err('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run] [--quiet]');
     return 2;
   }
   if (values.help) {
-    out('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run]');
+    out('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run] [--quiet]');
     return 0;
   }
+  const reporter = createTerminalProgressReporter({ stream: progressStream, quiet: values.quiet });
+  const onProgress = event => reporter.report(event);
   try {
     const opts = { environment: values.environment, origin: values.origin, account_id: values.account };
     const gid = values.game || values.workspace;
     let result;
     if (action === 'status') result = studio.status(opts);
-    else if (action === 'login') result = await studio.login(opts);
+    else if (action === 'login') result = await studio.login({ ...opts, onProgress });
     else if (action === 'logout') result = await studio.logout(opts);
-    else if (action === 'teams') result = await studio.listTeams(opts);
-    else if (action === 'games') result = await studio.listGames({ ...opts, team_id: values.team });
+    else if (action === 'teams') {
+      onProgress({ phase: 'teams', message: `チーム一覧を取得中 (${values.environment})...` });
+      result = await studio.listTeams(opts);
+    }
+    else if (action === 'games') {
+      onProgress({ phase: 'games', message: `試合一覧を取得中 (${values.team || 'all'})...` });
+      result = await studio.listGames({ ...opts, team_id: values.team });
+    }
     else if (action === 'workspaces') result = await studio.listWorkspaces({ ...opts, team_id: values.team });
     else if (action === 'videos') result = await studio.ensureVideoMetadata({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, force_refresh: values.refresh });
     else if (action === 'annotations') result = await studio.ensureTransitionAnnotations({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, force_refresh: values.refresh });
     else if (action === 'results') result = await studio.ensureAnalysisResults({ ...opts, team_id: values.team, game_id: gid, force_refresh: values.refresh });
     else if (action === 'fetch') {
       result = values.asset
-        ? await studio.ensureVideoFile({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, asset_id: values.asset, force_refresh: values.refresh })
-        : await studio.ensureMatchData({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, include_video: !values['no-video'], force_refresh: values.refresh });
+        ? await studio.ensureVideoFile({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, asset_id: values.asset, force_refresh: values.refresh, onProgress })
+        : await studio.ensureMatchData({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, include_video: !values['no-video'], force_refresh: values.refresh, onProgress });
     }
     else if (action === 'cache') result = studio.cacheStatus({ team_id: values.team, game_id: gid });
     else if (action === 'clean') {
@@ -1140,9 +1346,11 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
       err(`Unknown studio subcommand: ${action}`);
       return 2;
     }
+    reporter.finish();
     out(JSON.stringify(result, null, 2));
     return 0;
   } catch (error) {
+    reporter.finish();
     err(`Studio command failed: ${error.message}`);
     return 1;
   }
