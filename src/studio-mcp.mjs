@@ -479,28 +479,61 @@ export class StudioMCPClient {
     return text ? JSON.parse(text) : result;
   }
 
-  listWorkspaces(origin, { team_id, signal } = {}) {
-    return this.callTool(origin, 'list_workspaces', team_id ? { team_id } : {}, { signal });
+  listTeams(origin, { account_id, signal } = {}) {
+    return this.callTool(origin, 'list_teams', account_id ? { account_id } : {}, { signal });
   }
 
-  getVideoMetadata(origin, { team_id, workspace_id, video_id, signal }) {
+  listGames(origin, { team_id, account_id, signal } = {}) {
+    return this.callTool(origin, 'list_games', {
+      ...(team_id ? { team_id } : {}),
+      ...(account_id ? { account_id } : {})
+    }, { signal });
+  }
+
+  listWorkspaces(origin, { team_id, account_id, signal } = {}) {
+    return this.callTool(origin, 'list_workspaces', {
+      ...(team_id ? { team_id } : {}),
+      ...(account_id ? { account_id } : {})
+    }, { signal });
+  }
+
+  getVideoMetadata(origin, { team_id, game_id, workspace_id, account_id, video_id, signal }) {
+    const gid = game_id || workspace_id;
     return this.callTool(origin, 'get_video_metadata', {
-      team_id, workspace_id, ...(video_id ? { video_id } : {})
+      team_id,
+      game_id: gid,
+      ...(account_id ? { account_id } : {}),
+      ...(video_id ? { video_id } : {})
     }, { signal });
   }
 
-  getTransitionAnnotations(origin, { team_id, workspace_id, video_id, signal }) {
+  getTransitionAnnotations(origin, { team_id, game_id, workspace_id, account_id, video_id, signal }) {
+    const gid = game_id || workspace_id;
     return this.callTool(origin, 'get_transition_annotations', {
-      team_id, workspace_id, ...(video_id ? { video_id } : {})
+      team_id,
+      game_id: gid,
+      ...(account_id ? { account_id } : {}),
+      ...(video_id ? { video_id } : {})
     }, { signal });
   }
 
-  getVideoDownloadInfo(origin, { team_id, workspace_id, video_id, asset_id, signal }) {
+  getVideoDownloadInfo(origin, { team_id, game_id, workspace_id, account_id, video_id, asset_id, signal }) {
+    const gid = game_id || workspace_id;
     return this.callTool(origin, 'get_video_download_info', {
       team_id,
-      workspace_id,
+      game_id: gid,
+      ...(account_id ? { account_id } : {}),
       ...(video_id ? { video_id } : {}),
       ...(asset_id ? { asset_id } : {})
+    }, { signal });
+  }
+
+  getAnalysisResults(origin, { team_id, game_id, workspace_id, account_id, signal }) {
+    const gid = game_id || workspace_id;
+    return this.callTool(origin, 'get_analysis_results', {
+      team_id,
+      game_id: gid,
+      ...(account_id ? { account_id } : {})
     }, { signal });
   }
 }
@@ -561,20 +594,65 @@ export class StudioDataManager {
   login(opts = {}) { return this.oauth.login(opts); }
   logout(opts = {}) { return this.oauth.logout(opts); }
 
-  async listWorkspaces({ environment = 'dev', origin, team_id, signal } = {}) {
+  async listTeams({ environment = 'dev', origin, account_id, signal } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
-    return this.mcp.listWorkspaces(resolvedOrigin, { team_id, signal });
+    return this.mcp.listTeams(resolvedOrigin, { account_id, signal });
   }
 
-  async ensureVideoMetadata({ environment = 'dev', origin, team_id, workspace_id, video_id, force_refresh = false, signal } = {}) {
+  async listGames({ environment = 'dev', origin, team_id, account_id, signal } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    return this.mcp.listGames(resolvedOrigin, { team_id, account_id, signal });
+  }
+
+  async listWorkspaces({ environment = 'dev', origin, team_id, account_id, signal } = {}) {
+    const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    return this.mcp.listWorkspaces(resolvedOrigin, { team_id, account_id, signal });
+  }
+
+  async ensureAnalysisResults({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, force_refresh = false, signal } = {}) {
+    const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    const gid = game_id || workspace_id;
     safeId(team_id, 'team_id');
-    safeId(workspace_id, 'workspace_id');
+    safeId(gid, 'game_id');
+    const key = this._entryKey(resolvedOrigin, team_id, gid, 'results', 'all');
+    const filePath = this._safeCachePath(resolvedOrigin, team_id, gid, 'results', 'results.json');
+    const index = this._readIndex();
+    const existing = index.entries[key];
+    if (!force_refresh && existing && this._isPresentFile(filePath, existing.size_bytes)) {
+      const data = JSON.parse(readFileSync(filePath, 'utf8'));
+      existing.last_accessed_at = new Date().toISOString();
+      this._writeIndex(index);
+      return { source: 'cache', refetched_missing: false, path: filePath, sha256: existing.sha256, fetched_at: existing.fetched_at, data };
+    }
+    const refetchedMissing = Boolean(existing && !this._isPresentFile(filePath));
+    const data = await this.mcp.getAnalysisResults(resolvedOrigin, { team_id, game_id: gid, account_id, signal });
+    const buf = Buffer.from(JSON.stringify(data, null, 2), 'utf8');
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+    const tmp = `${filePath}.${randomBytes(6).toString('hex')}.tmp`;
+    writeFileSync(tmp, buf, { mode: 0o600 });
+    renameSync(tmp, filePath);
+    const now = new Date().toISOString();
+    const sha256 = sha256Hex(buf);
+    index.entries[key] = {
+      key, origin: resolvedOrigin, account_id: data.account_id || account_id || null,
+      team_id, workspace_id: gid, game_id: gid, kind: 'results',
+      video_id: null, asset_id: null, path: filePath, sha256,
+      size_bytes: buf.length, fetched_at: now, last_accessed_at: now
+    };
+    this._writeIndex(index);
+    return { source: 'remote', refetched_missing: refetchedMissing, path: filePath, sha256, fetched_at: now, data };
+  }
+
+  async ensureVideoMetadata({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, force_refresh = false, signal } = {}) {
+    const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    const gid = game_id || workspace_id;
+    safeId(team_id, 'team_id');
+    safeId(gid, 'game_id');
     if (video_id) safeId(video_id, 'video_id');
 
     const subKey = video_id || 'all';
-    const key = this._entryKey(resolvedOrigin, team_id, workspace_id, 'video_metadata', subKey);
-    const filePath = this._safeCachePath(resolvedOrigin, team_id, workspace_id, 'metadata', `videos-${subKey}.json`);
+    const key = this._entryKey(resolvedOrigin, team_id, gid, 'video_metadata', subKey);
+    const filePath = this._safeCachePath(resolvedOrigin, team_id, gid, 'metadata', `videos-${subKey}.json`);
     const index = this._readIndex();
     const existing = index.entries[key];
 
@@ -586,7 +664,7 @@ export class StudioDataManager {
     }
 
     const refetchedMissing = Boolean(existing && !this._isPresentFile(filePath));
-    const data = await this.mcp.getVideoMetadata(resolvedOrigin, { team_id, workspace_id, video_id, signal });
+    const data = await this.mcp.getVideoMetadata(resolvedOrigin, { team_id, game_id: gid, account_id, video_id, signal });
     const buf = Buffer.from(JSON.stringify(data, null, 2), 'utf8');
     mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
     const tmp = `${filePath}.${randomBytes(6).toString('hex')}.tmp`;
@@ -596,7 +674,8 @@ export class StudioDataManager {
     const now = new Date().toISOString();
     const sha256 = sha256Hex(buf);
     index.entries[key] = {
-      key, origin: resolvedOrigin, team_id, workspace_id, kind: 'video_metadata',
+      key, origin: resolvedOrigin, account_id: data.account_id || account_id || null,
+      team_id, workspace_id: gid, game_id: gid, kind: 'video_metadata',
       video_id: video_id || null, asset_id: null, path: filePath, sha256,
       size_bytes: buf.length, fetched_at: now, last_accessed_at: now
     };
@@ -604,15 +683,16 @@ export class StudioDataManager {
     return { source: 'remote', refetched_missing: refetchedMissing, path: filePath, sha256, fetched_at: now, data };
   }
 
-  async ensureTransitionAnnotations({ environment = 'dev', origin, team_id, workspace_id, video_id, force_refresh = false, signal } = {}) {
+  async ensureTransitionAnnotations({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, force_refresh = false, signal } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    const gid = game_id || workspace_id;
     safeId(team_id, 'team_id');
-    safeId(workspace_id, 'workspace_id');
+    safeId(gid, 'game_id');
     if (video_id) safeId(video_id, 'video_id');
 
     const subKey = video_id || 'all';
-    const key = this._entryKey(resolvedOrigin, team_id, workspace_id, 'annotations', subKey);
-    const filePath = this._safeCachePath(resolvedOrigin, team_id, workspace_id, 'annotations', `transitions-${subKey}.json`);
+    const key = this._entryKey(resolvedOrigin, team_id, gid, 'annotations', subKey);
+    const filePath = this._safeCachePath(resolvedOrigin, team_id, gid, 'annotations', `transitions-${subKey}.json`);
     const index = this._readIndex();
     const existing = index.entries[key];
 
@@ -627,7 +707,7 @@ export class StudioDataManager {
     }
 
     const refetchedMissing = Boolean(existing && !this._isPresentFile(filePath));
-    const data = await this.mcp.getTransitionAnnotations(resolvedOrigin, { team_id, workspace_id, video_id, signal });
+    const data = await this.mcp.getTransitionAnnotations(resolvedOrigin, { team_id, game_id: gid, account_id, video_id, signal });
     const buf = Buffer.from(JSON.stringify(data, null, 2), 'utf8');
     mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
     const tmp = `${filePath}.${randomBytes(6).toString('hex')}.tmp`;
@@ -637,7 +717,8 @@ export class StudioDataManager {
     const now = new Date().toISOString();
     const sha256 = sha256Hex(buf);
     index.entries[key] = {
-      key, origin: resolvedOrigin, team_id, workspace_id, kind: 'annotations',
+      key, origin: resolvedOrigin, account_id: data.account_id || account_id || null,
+      team_id, workspace_id: gid, game_id: gid, kind: 'annotations',
       video_id: video_id || null, asset_id: null, path: filePath, sha256,
       size_bytes: buf.length, revision: data.content_revision ?? 0, fetched_at: now, last_accessed_at: now
     };
@@ -648,17 +729,18 @@ export class StudioDataManager {
     };
   }
 
-  async ensureVideoFile({ environment = 'dev', origin, team_id, workspace_id, video_id, asset_id, force_refresh = false, verify_hash = true, signal } = {}) {
+  async ensureVideoFile({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, asset_id, force_refresh = false, verify_hash = true, signal } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
+    const gid = game_id || workspace_id;
     safeId(team_id, 'team_id');
-    safeId(workspace_id, 'workspace_id');
+    safeId(gid, 'game_id');
     if (video_id) safeId(video_id, 'video_id');
     if (asset_id) safeId(asset_id, 'asset_id');
     if (!video_id && !asset_id) throw new Error('video_id or asset_id is required');
 
     const index = this._readIndex();
     const cachedEntry = Object.values(index.entries).find(
-      entry => entry.origin === resolvedOrigin && entry.team_id === team_id && entry.workspace_id === workspace_id
+      entry => entry.origin === resolvedOrigin && entry.team_id === team_id && (entry.game_id === gid || entry.workspace_id === gid)
         && entry.kind === 'video_file'
         && (video_id ? entry.video_id === video_id : true)
         && (asset_id ? entry.asset_id === asset_id : true)
@@ -670,7 +752,7 @@ export class StudioDataManager {
         cachedEntry.last_accessed_at = new Date().toISOString();
         this._writeIndex(index);
         return {
-          source: 'cache', refetched_missing: false, path: cachedEntry.path, team_id, workspace_id,
+          source: 'cache', refetched_missing: false, path: cachedEntry.path, team_id, game_id: gid, workspace_id: gid,
           video_id: cachedEntry.video_id, asset_id: cachedEntry.asset_id, filename: cachedEntry.filename,
           sha256: cachedEntry.sha256, size_bytes: cachedEntry.size_bytes, fetched_at: cachedEntry.fetched_at
         };
@@ -678,10 +760,10 @@ export class StudioDataManager {
     }
 
     const refetchedMissing = Boolean(cachedEntry && !this._isPresentFile(cachedEntry.path));
-    const info = await this.mcp.getVideoDownloadInfo(resolvedOrigin, { team_id, workspace_id, video_id, asset_id, signal });
+    const info = await this.mcp.getVideoDownloadInfo(resolvedOrigin, { team_id, game_id: gid, account_id, video_id, asset_id, signal });
     const rawExt = extname(info.filename || '').toLowerCase();
     const safeExt = /^\.[a-z0-9]{1,8}$/.test(rawExt) ? rawExt : '.mp4';
-    const filePath = this._safeCachePath(resolvedOrigin, team_id, workspace_id, 'media', `${info.asset_id}${safeExt}`);
+    const filePath = this._safeCachePath(resolvedOrigin, team_id, gid, 'media', `${info.asset_id}${safeExt}`);
 
     mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
     const partPath = `${filePath}.${randomBytes(6).toString('hex')}.part`;
@@ -730,44 +812,49 @@ export class StudioDataManager {
     }
 
     const now = new Date().toISOString();
-    const key = this._entryKey(resolvedOrigin, team_id, workspace_id, 'video_file', info.asset_id);
+    const key = this._entryKey(resolvedOrigin, team_id, gid, 'video_file', info.asset_id);
     index.entries[key] = {
-      key, origin: resolvedOrigin, team_id, workspace_id, kind: 'video_file',
+      key, origin: resolvedOrigin, account_id: info.account_id || account_id || null,
+      team_id, workspace_id: gid, game_id: gid, kind: 'video_file',
       video_id: info.video_id, asset_id: info.asset_id, filename: info.filename || `${info.asset_id}${safeExt}`,
       path: filePath, sha256: info.sha256, size_bytes: info.size_bytes, fetched_at: now, last_accessed_at: now
     };
     this._writeIndex(index);
     return {
-      source: 'remote', refetched_missing: refetchedMissing, path: filePath, team_id, workspace_id,
+      source: 'remote', refetched_missing: refetchedMissing, path: filePath, team_id, game_id: gid, workspace_id: gid,
       video_id: info.video_id, asset_id: info.asset_id, filename: info.filename,
       sha256: info.sha256, size_bytes: info.size_bytes, fetched_at: now
     };
   }
 
-  async ensureMatchData({ environment = 'dev', origin, team_id, workspace_id, video_id, include_video = true, force_refresh = false, signal } = {}) {
-    const metadata = await this.ensureVideoMetadata({ environment, origin, team_id, workspace_id, video_id, force_refresh, signal });
-    const annotations = await this.ensureTransitionAnnotations({ environment, origin, team_id, workspace_id, video_id, force_refresh, signal });
+  async ensureMatchData({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, include_video = true, force_refresh = false, signal } = {}) {
+    const gid = game_id || workspace_id;
+    const metadata = await this.ensureVideoMetadata({ environment, origin, team_id, game_id: gid, account_id, video_id, force_refresh, signal });
+    const annotations = await this.ensureTransitionAnnotations({ environment, origin, team_id, game_id: gid, account_id, video_id, force_refresh, signal });
     const videos = [];
     if (include_video) {
       for (const v of metadata.data.videos || []) {
         videos.push(await this.ensureVideoFile({
-          environment, origin, team_id, workspace_id, video_id: v.id, asset_id: v.asset_id, force_refresh, signal
+          environment, origin, team_id, game_id: gid, account_id, video_id: v.id, asset_id: v.asset_id, force_refresh, signal
         }));
       }
     }
     return {
+      account_id: metadata.data.account_id || account_id || null,
       team_id,
-      workspace_id,
+      game_id: gid,
+      workspace_id: gid,
       video_metadata: { source: metadata.source, refetched_missing: metadata.refetched_missing, path: metadata.path, count: metadata.data.count },
       annotations: { source: annotations.source, refetched_missing: annotations.refetched_missing, path: annotations.path, count: annotations.data.count, content_revision: annotations.content_revision },
       videos
     };
   }
 
-  cacheStatus({ team_id, workspace_id } = {}) {
+  cacheStatus({ team_id, game_id, workspace_id } = {}) {
+    const gid = game_id || workspace_id;
     const index = this._readIndex();
     const entries = Object.values(index.entries).filter(
-      e => (!team_id || e.team_id === team_id) && (!workspace_id || e.workspace_id === workspace_id)
+      e => (!team_id || e.team_id === team_id) && (!gid || e.game_id === gid || e.workspace_id === gid)
     );
     let totalBytes = 0; let videoBytes = 0; let metadataBytes = 0;
     let presentCount = 0; let missingCount = 0;
@@ -797,7 +884,8 @@ export class StudioDataManager {
     };
   }
 
-  clean({ all = false, videos_only = false, team_id, workspace_id, max_age_hours, max_bytes, dry_run = false } = {}) {
+  clean({ all = false, videos_only = false, team_id, game_id, workspace_id, max_age_hours, max_bytes, dry_run = false } = {}) {
+    const gid = game_id || workspace_id;
     const index = this._readIndex();
     const now = Date.now();
     const allEntries = Object.values(index.entries);
@@ -805,10 +893,10 @@ export class StudioDataManager {
 
     const matchesScope = entry =>
       (!team_id || entry.team_id === team_id)
-      && (!workspace_id || entry.workspace_id === workspace_id)
+      && (!gid || entry.game_id === gid || entry.workspace_id === gid)
       && (!videos_only || entry.kind === 'video_file');
 
-    if ((all || videos_only || team_id || workspace_id) && max_age_hours === undefined && max_bytes === undefined) {
+    if ((all || videos_only || team_id || gid) && max_age_hours === undefined && max_bytes === undefined) {
       for (const entry of allEntries) if (matchesScope(entry)) toRemove.add(entry.key);
     }
     if (max_age_hours !== undefined) {
@@ -869,13 +957,15 @@ export class StudioDataManager {
 export function createStudioTool(manager) {
   return {
     name: 'studio_mcp',
-    label: 'Studio MCP (videos & transition annotations)',
-    description: 'Connect to TactixCore Studio API via OAuth (PKCE+DPoP) and MCP to fetch video metadata, video files, and transition annotations into the user profile cache (~/.config/tactixcore-code/studio-cache). Automatically re-fetches if a cached file is missing, and supports local cache cleanup.',
+    label: 'Studio MCP (teams, games, videos, annotations, results)',
+    description: 'Connect to TactixCore Studio API via OAuth (PKCE+DPoP) and MCP to list teams/games and fetch video metadata, video files, transition annotations, and analysis results into the user profile cache (~/.config/tactixcore-code/studio-cache). Automatically re-fetches if a cached file is missing, and supports per-team/per-game/videos-only local cache cleanup.',
     parameters: Type.Object({
-      action: Type.Union(['status', 'login', 'logout', 'workspaces', 'videos', 'annotations', 'ensure_video', 'ensure_match', 'cache_status', 'clean'].map(v => Type.Literal(v))),
+      action: Type.Union(['status', 'login', 'logout', 'teams', 'games', 'workspaces', 'videos', 'annotations', 'results', 'ensure_video', 'ensure_match', 'cache_status', 'clean'].map(v => Type.Literal(v))),
       environment: Type.Optional(Type.Union([Type.Literal('dev'), Type.Literal('prd')])),
       origin: Type.Optional(Type.String()),
+      account_id: Type.Optional(Type.String()),
       team_id: Type.Optional(Type.String()),
+      game_id: Type.Optional(Type.String()),
       workspace_id: Type.Optional(Type.String()),
       video_id: Type.Optional(Type.String()),
       asset_id: Type.Optional(Type.String()),
@@ -889,17 +979,21 @@ export function createStudioTool(manager) {
     }, { additionalProperties: false }),
     async execute(_id, args, signal) {
       const env = args.environment || 'dev';
+      const gid = args.game_id || args.workspace_id;
       let result;
       if (args.action === 'status') result = manager.status({ environment: env, origin: args.origin });
       else if (args.action === 'login') result = await manager.login({ environment: env, origin: args.origin });
       else if (args.action === 'logout') result = await manager.logout({ environment: env, origin: args.origin });
-      else if (args.action === 'workspaces') result = await manager.listWorkspaces({ environment: env, origin: args.origin, team_id: args.team_id, signal });
-      else if (args.action === 'videos') result = await manager.ensureVideoMetadata({ environment: env, origin: args.origin, team_id: args.team_id, workspace_id: args.workspace_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'annotations') result = await manager.ensureTransitionAnnotations({ environment: env, origin: args.origin, team_id: args.team_id, workspace_id: args.workspace_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'ensure_video') result = await manager.ensureVideoFile({ environment: env, origin: args.origin, team_id: args.team_id, workspace_id: args.workspace_id, video_id: args.video_id, asset_id: args.asset_id, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'ensure_match') result = await manager.ensureMatchData({ environment: env, origin: args.origin, team_id: args.team_id, workspace_id: args.workspace_id, video_id: args.video_id, include_video: args.include_video !== false, force_refresh: Boolean(args.force_refresh), signal });
-      else if (args.action === 'cache_status') result = manager.cacheStatus({ team_id: args.team_id, workspace_id: args.workspace_id });
-      else if (args.action === 'clean') result = manager.clean({ all: Boolean(args.all), videos_only: Boolean(args.videos_only), team_id: args.team_id, workspace_id: args.workspace_id, max_age_hours: args.max_age_hours, max_bytes: args.max_bytes, dry_run: Boolean(args.dry_run) });
+      else if (args.action === 'teams') result = await manager.listTeams({ environment: env, origin: args.origin, account_id: args.account_id, signal });
+      else if (args.action === 'games') result = await manager.listGames({ environment: env, origin: args.origin, team_id: args.team_id, account_id: args.account_id, signal });
+      else if (args.action === 'workspaces') result = await manager.listWorkspaces({ environment: env, origin: args.origin, team_id: args.team_id, account_id: args.account_id, signal });
+      else if (args.action === 'videos') result = await manager.ensureVideoMetadata({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'annotations') result = await manager.ensureTransitionAnnotations({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'results') result = await manager.ensureAnalysisResults({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'ensure_video') result = await manager.ensureVideoFile({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, asset_id: args.asset_id, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'ensure_match') result = await manager.ensureMatchData({ environment: env, origin: args.origin, team_id: args.team_id, game_id: gid, account_id: args.account_id, video_id: args.video_id, include_video: args.include_video !== false, force_refresh: Boolean(args.force_refresh), signal });
+      else if (args.action === 'cache_status') result = manager.cacheStatus({ team_id: args.team_id, game_id: gid });
+      else if (args.action === 'clean') result = manager.clean({ all: Boolean(args.all), videos_only: Boolean(args.videos_only), team_id: args.team_id, game_id: gid, max_age_hours: args.max_age_hours, max_bytes: args.max_bytes, dry_run: Boolean(args.dry_run) });
       else throw new Error('Unknown studio_mcp action');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], details: {} };
     }
@@ -909,7 +1003,7 @@ export function createStudioTool(manager) {
 export function studioExtension(manager) {
   return pi => {
     pi.registerCommand('studio', {
-      description: 'Studio MCP OAuth & cache: /studio login|status|logout|workspaces|fetch|cache|clean [dev|prd] [--videos-only]',
+      description: 'Studio MCP OAuth & cache: /studio login|status|logout|teams|games|fetch|cache|clean [dev|prd]',
       handler: async (args, ctx) => {
         const parts = String(args || '').trim().split(/\s+/).filter(Boolean);
         const sub = parts[0] || 'status';
@@ -931,24 +1025,31 @@ export function studioExtension(manager) {
             ctx.ui.notify(`Studio OAuth disconnected (${env}).`, 'info');
             return;
           }
-          if (sub === 'workspaces') {
-            const res = await manager.listWorkspaces({ environment: env });
-            const lines = (res.workspaces || []).map(w => `${w.owner_team_id}/${w.id} (${w.name || w.kind})`).join(', ');
-            ctx.ui.notify(`Workspaces (${res.count}): ${lines || 'none'}`, 'info');
+          if (sub === 'teams') {
+            const res = await manager.listTeams({ environment: env });
+            const lines = (res.teams || []).map(t => `${t.team_id}(${t.game_count}試合)`).join(', ');
+            ctx.ui.notify(`Teams (${res.count}): ${lines || 'none'}`, 'info');
+            return;
+          }
+          if (sub === 'games' || sub === 'workspaces') {
+            const teamArg = parts.slice(1).find(p => !p.startsWith('--') && p !== 'dev' && p !== 'prd');
+            const res = await manager.listGames({ environment: env, team_id: teamArg });
+            const lines = (res.games || []).map(g => `${g.team_id}/${g.game_id} (${g.name || g.workspace_id})`).join(', ');
+            ctx.ui.notify(`Games (${res.count}): ${lines || 'none'}`, 'info');
             return;
           }
           if (sub === 'fetch') {
             const positional = parts.slice(1).filter(p => !p.startsWith('--') && p !== 'dev' && p !== 'prd');
-            const [team_id, workspace_id, video_id] = positional;
-            if (!team_id || !workspace_id) {
-              ctx.ui.notify('Usage: /studio fetch <team_id> <workspace_id> [video_id] [--no-video] [--refresh]', 'warning');
+            const [team_id, game_id, video_id] = positional;
+            if (!team_id || !game_id) {
+              ctx.ui.notify('Usage: /studio fetch <team_id> <game_id> [video_id] [--no-video] [--refresh]', 'warning');
               return;
             }
             const include_video = !parts.includes('--no-video');
             const force_refresh = parts.includes('--refresh');
-            ctx.ui.notify(`Fetching Studio data (${team_id}/${workspace_id})...`, 'info');
-            const res = await manager.ensureMatchData({ environment: env, team_id, workspace_id, video_id, include_video, force_refresh });
-            ctx.ui.notify(`Fetched ${team_id}/${workspace_id}: metadata(${res.video_metadata.source}), annotations(${res.annotations.source}, ${res.annotations.count}件), videos(${res.videos.length}本)`, 'info');
+            ctx.ui.notify(`Fetching Studio data (${team_id}/${game_id})...`, 'info');
+            const res = await manager.ensureMatchData({ environment: env, team_id, game_id, video_id, include_video, force_refresh });
+            ctx.ui.notify(`Fetched ${team_id}/${game_id}: metadata(${res.video_metadata.source}), annotations(${res.annotations.source}, ${res.annotations.count}件), videos(${res.videos.length}本)`, 'info');
             return;
           }
           if (sub === 'cache') {
@@ -962,7 +1063,7 @@ export function studioExtension(manager) {
             ctx.ui.notify(`Studio cache cleaned: removed ${res.removed_count} files (${res.reclaimed_bytes} bytes reclaimed).`, 'info');
             return;
           }
-          ctx.ui.notify('Usage: /studio login|status|logout|workspaces|fetch|cache|clean [dev|prd] [--videos-only]', 'warning');
+          ctx.ui.notify('Usage: /studio login|status|logout|teams|games|fetch|cache|clean [dev|prd] [--videos-only]', 'warning');
         } catch (error) {
           ctx.ui.notify(`Studio error: ${error.message}`, 'error');
         }
@@ -982,7 +1083,9 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
       options: {
         environment: { type: 'string', default: 'dev' },
         origin: { type: 'string' },
+        account: { type: 'string' },
         team: { type: 'string' },
+        game: { type: 'string' },
         workspace: { type: 'string' },
         video: { type: 'string' },
         asset: { type: 'string' },
@@ -997,34 +1100,38 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
       }
     }));
   } catch {
-    err('Usage: tactixcore-code studio login|status|logout|workspaces|videos|annotations|fetch|cache|clean [--environment dev|prd] [--team ID] [--workspace ID] [--video ID] [--videos-only] [--all] [--dry-run]');
+    err('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run]');
     return 2;
   }
   if (values.help) {
-    out('Usage: tactixcore-code studio login|status|logout|workspaces|videos|annotations|fetch|cache|clean [--environment dev|prd] [--team ID] [--workspace ID] [--video ID] [--videos-only] [--all] [--dry-run]');
+    out('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run]');
     return 0;
   }
   try {
-    const opts = { environment: values.environment, origin: values.origin };
+    const opts = { environment: values.environment, origin: values.origin, account_id: values.account };
+    const gid = values.game || values.workspace;
     let result;
     if (action === 'status') result = studio.status(opts);
     else if (action === 'login') result = await studio.login(opts);
     else if (action === 'logout') result = await studio.logout(opts);
+    else if (action === 'teams') result = await studio.listTeams(opts);
+    else if (action === 'games') result = await studio.listGames({ ...opts, team_id: values.team });
     else if (action === 'workspaces') result = await studio.listWorkspaces({ ...opts, team_id: values.team });
-    else if (action === 'videos') result = await studio.ensureVideoMetadata({ ...opts, team_id: values.team, workspace_id: values.workspace, video_id: values.video, force_refresh: values.refresh });
-    else if (action === 'annotations') result = await studio.ensureTransitionAnnotations({ ...opts, team_id: values.team, workspace_id: values.workspace, video_id: values.video, force_refresh: values.refresh });
+    else if (action === 'videos') result = await studio.ensureVideoMetadata({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, force_refresh: values.refresh });
+    else if (action === 'annotations') result = await studio.ensureTransitionAnnotations({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, force_refresh: values.refresh });
+    else if (action === 'results') result = await studio.ensureAnalysisResults({ ...opts, team_id: values.team, game_id: gid, force_refresh: values.refresh });
     else if (action === 'fetch') {
       result = values.asset
-        ? await studio.ensureVideoFile({ ...opts, team_id: values.team, workspace_id: values.workspace, video_id: values.video, asset_id: values.asset, force_refresh: values.refresh })
-        : await studio.ensureMatchData({ ...opts, team_id: values.team, workspace_id: values.workspace, video_id: values.video, include_video: !values['no-video'], force_refresh: values.refresh });
+        ? await studio.ensureVideoFile({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, asset_id: values.asset, force_refresh: values.refresh })
+        : await studio.ensureMatchData({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, include_video: !values['no-video'], force_refresh: values.refresh });
     }
-    else if (action === 'cache') result = studio.cacheStatus({ team_id: values.team, workspace_id: values.workspace });
+    else if (action === 'cache') result = studio.cacheStatus({ team_id: values.team, game_id: gid });
     else if (action === 'clean') {
       result = studio.clean({
         all: values.all,
         videos_only: values['videos-only'],
         team_id: values.team,
-        workspace_id: values.workspace,
+        game_id: gid,
         max_age_hours: values['max-age-hours'] !== undefined ? Number(values['max-age-hours']) : undefined,
         max_bytes: values['max-bytes'] !== undefined ? Number(values['max-bytes']) : undefined,
         dry_run: values['dry-run']
