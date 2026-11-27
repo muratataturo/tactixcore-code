@@ -4,8 +4,10 @@ import {
   readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync
 } from 'node:fs';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { Type } from 'typebox';
 
@@ -26,6 +28,112 @@ const DEFAULT_PROFILES = {
 const DEFAULT_SCOPES = ['workspace:read'];
 const MCP_PATH = '/mcp/studio/';
 const MCP_PROTOCOL_VERSION = '2025-03-26';
+export const DEFAULT_CACHE_POLICY = {
+  schema_version: 1,
+  enabled: true,
+  max_bytes: 20 * 1024 * 1024 * 1024, // 20 GiB
+  max_age_hours: 14 * 24,             // 14 days
+  videos_only: false
+};
+const LAUNCHD_LABEL = 'com.tactixcore.code.studio-cache-clean';
+
+function xmlEscape(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+export function buildCacheCleanLaunchdPlist({ nodePath = process.execPath, cliPath, profileDir, hour = 4, minute = 0 } = {}) {
+  const binPath = cliPath || fileURLToPath(new URL('../bin/tactixcore-code.mjs', import.meta.url));
+  const logPath = join(resolve(profileDir), 'cache-clean.log');
+  const safeHour = Math.max(0, Math.min(23, Math.floor(Number(hour) || 0)));
+  const safeMinute = Math.max(0, Math.min(59, Math.floor(Number(minute) || 0)));
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscape(LAUNCHD_LABEL)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEscape(nodePath)}</string>
+    <string>${xmlEscape(binPath)}</string>
+    <string>studio</string>
+    <string>clean</string>
+    <string>--policy</string>
+    <string>--quiet</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>${safeHour}</integer>
+    <key>Minute</key>
+    <integer>${safeMinute}</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(logPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(logPath)}</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
+`;
+}
+
+export function manageCacheCleanSchedule(action, {
+  profileDir,
+  launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents'),
+  hour = 4,
+  minute = 0,
+  runLaunchctl = process.platform === 'darwin'
+} = {}) {
+  const plistPath = join(resolve(launchAgentsDir), `${LAUNCHD_LABEL}.plist`);
+  if (action === 'status') {
+    return {
+      label: LAUNCHD_LABEL,
+      installed: existsSync(plistPath),
+      plist_path: plistPath,
+      platform: process.platform
+    };
+  }
+  if (action === 'install') {
+    if (process.platform !== 'darwin' && runLaunchctl) {
+      throw new Error('Automatic launchd schedule installation is only supported on macOS. Use cron to run: tactixcore-code studio clean --policy --quiet');
+    }
+    mkdirSync(dirname(plistPath), { recursive: true, mode: 0o755 });
+    const plist = buildCacheCleanLaunchdPlist({ profileDir, hour, minute });
+    writeFileSync(plistPath, plist, { mode: 0o644 });
+    let loaded = false;
+    if (runLaunchctl) {
+      spawnSync('launchctl', ['unload', plistPath], { stdio: 'ignore' });
+      const res = spawnSync('launchctl', ['load', plistPath], { encoding: 'utf8' });
+      loaded = res.status === 0;
+    }
+    return {
+      label: LAUNCHD_LABEL,
+      installed: true,
+      loaded,
+      plist_path: plistPath,
+      schedule: `daily ${String(Math.max(0, Math.min(23, Math.floor(Number(hour) || 0)))).padStart(2, '0')}:${String(Math.max(0, Math.min(59, Math.floor(Number(minute) || 0)))).padStart(2, '0')}`
+    };
+  }
+  if (action === 'uninstall') {
+    if (runLaunchctl && existsSync(plistPath)) {
+      spawnSync('launchctl', ['unload', plistPath], { stdio: 'ignore' });
+    }
+    rmSync(plistPath, { force: true });
+    return {
+      label: LAUNCHD_LABEL,
+      installed: false,
+      plist_path: plistPath
+    };
+  }
+  throw new Error(`Unknown schedule action: ${action}`);
+}
 const PKG_VERSION = (() => {
   try {
     return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || '0.0.0';
@@ -722,6 +830,68 @@ export class StudioDataManager {
     this.mcp = mcp || new StudioMCPClient(this.oauth);
     this.cacheDir = cacheDir ? resolve(cacheDir) : join(this.profileDir, 'studio-cache');
     this.indexFile = join(this.cacheDir, 'index.json');
+    this.policyFile = join(this.profileDir, 'studio-cache-policy.json');
+  }
+
+  getCachePolicy() {
+    let saved = {};
+    if (existsSync(this.policyFile)) {
+      try {
+        const parsed = JSON.parse(readFileSync(this.policyFile, 'utf8'));
+        if (parsed && typeof parsed === 'object') saved = parsed;
+      } catch { /* ignore corrupt policy */ }
+    }
+    const envMaxGb = process.env.TACTIXCORE_STUDIO_CACHE_MAX_GB;
+    const envMaxDays = process.env.TACTIXCORE_STUDIO_CACHE_MAX_AGE_DAYS;
+    const maxBytes = envMaxGb !== undefined && Number.isFinite(Number(envMaxGb)) && Number(envMaxGb) >= 0
+      ? Math.round(Number(envMaxGb) * 1024 * 1024 * 1024)
+      : (Number.isFinite(Number(saved.max_bytes)) && Number(saved.max_bytes) >= 0 ? Number(saved.max_bytes) : DEFAULT_CACHE_POLICY.max_bytes);
+    const maxAgeHours = envMaxDays !== undefined && Number.isFinite(Number(envMaxDays)) && Number(envMaxDays) >= 0
+      ? Math.round(Number(envMaxDays) * 24)
+      : (Number.isFinite(Number(saved.max_age_hours)) && Number(saved.max_age_hours) >= 0 ? Number(saved.max_age_hours) : DEFAULT_CACHE_POLICY.max_age_hours);
+    return {
+      schema_version: 1,
+      enabled: typeof saved.enabled === 'boolean' ? saved.enabled : DEFAULT_CACHE_POLICY.enabled,
+      max_bytes: maxBytes,
+      max_age_hours: maxAgeHours,
+      videos_only: typeof saved.videos_only === 'boolean' ? saved.videos_only : DEFAULT_CACHE_POLICY.videos_only,
+      policy_file: this.policyFile
+    };
+  }
+
+  setCachePolicy(patch = {}) {
+    const current = this.getCachePolicy();
+    const next = {
+      schema_version: 1,
+      enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
+      max_bytes: patch.max_bytes !== undefined ? Math.max(0, Math.round(Number(patch.max_bytes))) : current.max_bytes,
+      max_age_hours: patch.max_age_hours !== undefined ? Math.max(0, Math.round(Number(patch.max_age_hours))) : current.max_age_hours,
+      videos_only: typeof patch.videos_only === 'boolean' ? patch.videos_only : current.videos_only
+    };
+    if (!Number.isFinite(next.max_bytes)) throw new Error('Invalid max_bytes');
+    if (!Number.isFinite(next.max_age_hours)) throw new Error('Invalid max_age_hours');
+    mkdirSync(this.profileDir, { recursive: true, mode: 0o700 });
+    atomicWriteJson(this.policyFile, next, 0o600);
+    return { ...next, policy_file: this.policyFile };
+  }
+
+  autoPrune({ protect_team_id = null, protect_game_id = null, onProgress = null } = {}) {
+    const policy = this.getCachePolicy();
+    if (!policy.enabled) {
+      return { enabled: false, removed_count: 0, reclaimed_bytes: 0, removed_paths: [] };
+    }
+    const res = this.clean({
+      use_policy: true,
+      protect_team_id,
+      protect_game_id
+    });
+    if (res.removed_count > 0) {
+      onProgress?.({
+        phase: 'cache_prune',
+        message: `キャッシュ自動整理: ${res.removed_count}件 (${formatBytes(res.reclaimed_bytes)}) を削除しました (残り ${formatBytes(res.remaining_bytes)})`
+      });
+    }
+    return { enabled: true, ...res };
   }
 
   _ensureCacheDir() {
@@ -1085,6 +1255,7 @@ export class StudioDataManager {
       path: filePath, sha256: info.sha256, size_bytes: info.size_bytes, fetched_at: now, last_accessed_at: now
     };
     this._writeIndex(index);
+    this.autoPrune({ protect_team_id: team_id, protect_game_id: gid, onProgress });
     return {
       source: 'remote', refetched_missing: refetchedMissing, path: filePath, team_id, game_id: gid, workspace_id: gid,
       video_id: info.video_id, asset_id: info.asset_id, filename: info.filename,
@@ -1160,15 +1331,31 @@ export class StudioDataManager {
     };
   }
 
-  clean({ all = false, videos_only = false, team_id, game_id, workspace_id, max_age_hours, max_bytes, dry_run = false } = {}) {
+  clean({
+    all = false, videos_only = false, team_id, game_id, workspace_id,
+    max_age_hours, max_bytes, dry_run = false, use_policy = false,
+    protect_team_id = null, protect_game_id = null
+  } = {}) {
     const gid = game_id || workspace_id;
+    if (use_policy) {
+      const policy = this.getCachePolicy();
+      if (max_age_hours === undefined && policy.max_age_hours > 0) max_age_hours = policy.max_age_hours;
+      if (max_bytes === undefined && policy.max_bytes >= 0) max_bytes = policy.max_bytes;
+      if (!videos_only && policy.videos_only) videos_only = true;
+    }
     const index = this._readIndex();
     const now = Date.now();
     const allEntries = Object.values(index.entries);
     const toRemove = new Set();
 
+    const isProtected = entry => Boolean(
+      protect_team_id && protect_game_id
+      && entry.team_id === protect_team_id
+      && (entry.game_id === protect_game_id || entry.workspace_id === protect_game_id)
+    );
     const matchesScope = entry =>
-      (!team_id || entry.team_id === team_id)
+      !isProtected(entry)
+      && (!team_id || entry.team_id === team_id)
       && (!gid || entry.game_id === gid || entry.workspace_id === gid)
       && (!videos_only || entry.kind === 'video_file');
 
@@ -1185,6 +1372,10 @@ export class StudioDataManager {
     }
     if (max_bytes !== undefined) {
       const limit = Math.max(0, Number(max_bytes));
+      const allLive = allEntries.filter(e => !toRemove.has(e.key));
+      const protectedBytes = allLive
+        .filter(e => isProtected(e))
+        .reduce((sum, e) => sum + (this._isPresentFile(e.path) ? lstatSync(e.path).size : 0), 0);
       const surviving = allEntries
         .filter(e => !toRemove.has(e.key) && matchesScope(e))
         .map(e => ({
@@ -1193,7 +1384,7 @@ export class StudioDataManager {
           ts: Date.parse(e.last_accessed_at || e.fetched_at || 0) || 0
         }))
         .sort((a, b) => a.ts - b.ts);
-      let currentBytes = surviving.reduce((sum, x) => sum + x.bytes, 0);
+      let currentBytes = protectedBytes + surviving.reduce((sum, x) => sum + x.bytes, 0);
       for (const item of surviving) {
         if (currentBytes <= limit) break;
         toRemove.add(item.entry.key);
@@ -1431,22 +1622,31 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
         video: { type: 'string' },
         asset: { type: 'string' },
         'max-age-hours': { type: 'string' },
+        'max-age-days': { type: 'string' },
         'max-bytes': { type: 'string' },
+        'max-gb': { type: 'string' },
+        hour: { type: 'string' },
         refresh: { type: 'boolean', default: false },
         'no-video': { type: 'boolean', default: false },
         all: { type: 'boolean', default: false },
         'videos-only': { type: 'boolean', default: false },
+        'all-kinds': { type: 'boolean', default: false },
+        policy: { type: 'boolean', default: false },
+        enable: { type: 'boolean', default: false },
+        disable: { type: 'boolean', default: false },
+        'install-schedule': { type: 'boolean', default: false },
+        'uninstall-schedule': { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
         quiet: { type: 'boolean', default: false },
         help: { type: 'boolean', default: false }
       }
     }));
   } catch {
-    err('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run] [--quiet]');
+    err('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|cache-policy|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--policy] [--dry-run] [--quiet]');
     return 2;
   }
   if (values.help) {
-    out('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--dry-run] [--quiet]');
+    out('Usage: tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|cache-policy|clean [--environment dev|prd] [--team ID] [--game ID] [--videos-only] [--all] [--policy] [--dry-run] [--quiet]');
     return 0;
   }
   const reporter = createTerminalProgressReporter({ stream: progressStream, quiet: values.quiet });
@@ -1475,7 +1675,29 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
         ? await studio.ensureVideoFile({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, asset_id: values.asset, force_refresh: values.refresh, onProgress })
         : await studio.ensureMatchData({ ...opts, team_id: values.team, game_id: gid, video_id: values.video, include_video: !values['no-video'], force_refresh: values.refresh, onProgress });
     }
-    else if (action === 'cache') result = studio.cacheStatus({ team_id: values.team, game_id: gid });
+    else if (action === 'cache') result = { ...studio.cacheStatus({ team_id: values.team, game_id: gid }), policy: studio.getCachePolicy() };
+    else if (action === 'cache-policy') {
+      const patch = {};
+      if (values['max-gb'] !== undefined) patch.max_bytes = Number(values['max-gb']) * 1024 * 1024 * 1024;
+      if (values['max-bytes'] !== undefined) patch.max_bytes = Number(values['max-bytes']);
+      if (values['max-age-days'] !== undefined) patch.max_age_hours = Number(values['max-age-days']) * 24;
+      if (values['max-age-hours'] !== undefined) patch.max_age_hours = Number(values['max-age-hours']);
+      if (values['videos-only']) patch.videos_only = true;
+      if (values['all-kinds']) patch.videos_only = false;
+      if (values.enable) patch.enabled = true;
+      if (values.disable) patch.enabled = false;
+      const policy = Object.keys(patch).length > 0 ? studio.setCachePolicy(patch) : studio.getCachePolicy();
+      let schedule = manageCacheCleanSchedule('status', { profileDir: studio.profileDir });
+      if (values['install-schedule']) {
+        schedule = manageCacheCleanSchedule('install', {
+          profileDir: studio.profileDir,
+          hour: values.hour !== undefined ? Number(values.hour) : 4
+        });
+      } else if (values['uninstall-schedule']) {
+        schedule = manageCacheCleanSchedule('uninstall', { profileDir: studio.profileDir });
+      }
+      result = { policy, schedule, cache: studio.cacheStatus() };
+    }
     else if (action === 'clean') {
       result = studio.clean({
         all: values.all,
@@ -1484,6 +1706,7 @@ export async function runStudioCommand(flags, { profile, out = console.log, err 
         game_id: gid,
         max_age_hours: values['max-age-hours'] !== undefined ? Number(values['max-age-hours']) : undefined,
         max_bytes: values['max-bytes'] !== undefined ? Number(values['max-bytes']) : undefined,
+        use_policy: values.policy,
         dry_run: values['dry-run']
       });
     } else {

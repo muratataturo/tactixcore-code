@@ -10,7 +10,7 @@ const help = `Usage
   tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
-  tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--quiet]
+  tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|cache-policy|clean [--environment dev|prd] [--quiet]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
   tactixcore-code pi --prompt TEXT --skill SKILL --playground PATH --team ID --game ID --analysis-input FILE
   tactixcore-code skills list

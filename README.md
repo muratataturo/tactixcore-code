@@ -46,10 +46,14 @@ tactixcore-code studio teams --environment dev
 tactixcore-code studio games --environment dev --team TEAM_ID
 tactixcore-code studio fetch --environment dev --team TEAM_ID --game GAME_ID
 tactixcore-code studio cache
+tactixcore-code studio cache-policy --max-gb 20 --max-age-days 14 --install-schedule
+tactixcore-code studio clean --policy
 tactixcore-code studio clean --videos-only
 ```
 
 `studio login` / `teams` / `games` / `fetch` は進捗（動画ダウンロードの進捗バー・速度・ETA、キャッシュ SHA-256 検証、ステップ経過、OAuth 待機残り時間）を `stderr` に表示し、`stdout` は機械可読な JSON のまま保ちます。進捗表示を抑止したい場合は `--quiet` を指定してください。
+
+動画は GCS が原本のため、ローカルキャッシュ（`~/.config/tactixcore-code/studio-cache/`）は既定で **最大 20 GiB・14日間** を上限として `studio fetch` 時に古い試合から自動 LRU 削除されます（取得中の試合は保護されます）。`studio cache-policy --install-schedule` で macOS `launchd` による毎日の定時クリーンも有効化できます。
 
 ## Pi の対話画面を開く
 
