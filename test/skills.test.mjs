@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeAnalysis, planAnalysis } from '../src/analysis.mjs';
@@ -163,6 +163,62 @@ test('opponent fixture rejects a different team and an unaccepted engine result'
     }
   }), 1);
   assert.match(errors[0], /Analysis failed/);
+  assert.match(errors[0], /engine\.log/);
+});
+
+test('planAnalysis accepts inputs stored under ~/.config/tactixcore-code/studio-cache and rejects arbitrary external paths', t => {
+  const skill = 'soccer-player';
+  const { dir, file, scope } = playground(t, skill, 'focus_player_comment', 'playeranalysis');
+  const xdg = mkdtempSync(join(tmpdir(), 'tc-xdg-'));
+  const outside = mkdtempSync(join(tmpdir(), 'tc-outside-'));
+  t.after(() => {
+    rmSync(xdg, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  const cacheMediaDir = join(xdg, 'tactixcore-code', 'studio-cache', 'origin01', 'teams', scope.team_id, scope.game_id, 'media');
+  mkdirSync(cacheMediaDir, { recursive: true });
+  const cachedVideo = join(cacheMediaDir, 'asset1.mp4');
+  writeFileSync(cachedVideo, 'fake-mp4');
+  const cachedComments = join(cacheMediaDir, 'comments.json');
+  writeFileSync(cachedComments, JSON.stringify({
+    team_id: scope.team_id, game_id: scope.game_id, video_id: 'video-test',
+    annotations: [{ id: 'human-1', author_role: 'coach', time: 12, comment: 'Good press' }]
+  }));
+  const cachedManifest = join(cacheMediaDir, 'player-input.json');
+  writeFileSync(cachedManifest, JSON.stringify({
+    ...scope, player_id: 'confirmed-player', video_id: 'video-test',
+    confirmed_annotation_ids: ['human-1'],
+    comments: cachedComments, video: cachedVideo, tracks_dir: 'tracks'
+  }));
+
+  const plan = planAnalysis(skill, {
+    playground: dir,
+    team: scope.team_id,
+    game: scope.game_id,
+    player: 'confirmed-player',
+    input: cachedManifest,
+    env: { XDG_CONFIG_HOME: xdg }
+  });
+  assert.equal(plan.args.includes(realpathSync(cachedVideo)), true);
+  assert.equal(plan.args.includes(realpathSync(cachedComments)), true);
+
+  // Arbitrary external file outside playground and studio-cache must still be rejected
+  const outsideVideo = join(outside, 'secret.mp4');
+  writeFileSync(outsideVideo, 'secret');
+  const badManifest = file('bad-input.json', {
+    ...scope, player_id: 'confirmed-player', video_id: 'video-test',
+    confirmed_annotation_ids: ['human-1'],
+    comments: cachedComments, video: outsideVideo, tracks_dir: 'tracks'
+  });
+  assert.throws(() => planAnalysis(skill, {
+    playground: dir,
+    team: scope.team_id,
+    game: scope.game_id,
+    player: 'confirmed-player',
+    input: badManifest,
+    env: { XDG_CONFIG_HOME: xdg }
+  }), /Path outside playground and studio-cache/);
 });
 
 test('web search normalizes only public citation candidates', async () => {

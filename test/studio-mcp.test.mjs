@@ -27,7 +27,7 @@ function verifyDpop(proof, method, expectedUrl, expectedJwk, expectedToken = nul
   }
 }
 
-async function startMockStudio({ videoSizeBytes = null } = {}) {
+async function startMockStudio({ videoSizeBytes = null, failMediaFirstN = 0 } = {}) {
   const videoBytes = videoSizeBytes
     ? Buffer.alloc(videoSizeBytes, 0x61)
     : Buffer.from('MOCK_VIDEO_BYTES_'.repeat(2500));
@@ -36,6 +36,8 @@ async function startMockStudio({ videoSizeBytes = null } = {}) {
   const codes = new Map();
   const devices = new Map();
   let mediaCalls = 0;
+  let refreshCalls = 0;
+  let mediaFailuresRemaining = failMediaFirstN;
 
   const server = createServer(async (req, res) => {
     const origin = `http://127.0.0.1:${server.address().port}`;
@@ -63,6 +65,17 @@ async function startMockStudio({ videoSizeBytes = null } = {}) {
     }
     if (req.method === 'POST' && url.pathname === '/auth/token') {
       const form = new URLSearchParams(raw);
+      if (form.get('grant_type') === 'refresh_token') {
+        refreshCalls++;
+        const device = devices.get(form.get('device_id'));
+        if (!device || device.refresh !== form.get('refresh_token')) return json(401, { error: 'invalid_grant' });
+        verifyDpop(req.headers.dpop, 'POST', `${origin}/auth/token`, device.jwk);
+        const access = 'acc_' + randomBytes(12).toString('hex');
+        const refresh = 'ref_' + randomBytes(12).toString('hex');
+        device.access = access;
+        device.refresh = refresh;
+        return json(200, { access_token: access, refresh_token: refresh, token_type: 'DPoP', expires_in: 900, scope: 'workspace:read' });
+      }
       const code = form.get('code');
       const row = codes.get(code);
       codes.delete(code);
@@ -107,6 +120,10 @@ async function startMockStudio({ videoSizeBytes = null } = {}) {
     if (req.method === 'GET' && url.pathname === '/api/studio/v1/workspaces/team_a/m1/media/a1') {
       if (!auth()) return json(401, { error: 'auth_required' });
       mediaCalls++;
+      if (mediaFailuresRemaining > 0) {
+        mediaFailuresRemaining--;
+        return json(503, { error: 'temporarily_unavailable' });
+      }
       const range = req.headers.range;
       const [, s, e] = range.match(/^bytes=(\d+)-(\d+)$/);
       const slice = videoBytes.subarray(Number(s), Number(e) + 1);
@@ -117,7 +134,7 @@ async function startMockStudio({ videoSizeBytes = null } = {}) {
     json(404, { error: 'not_found' });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { origin: `http://127.0.0.1:${server.address().port}`, videoBytes, videoSha, getMediaCalls: () => mediaCalls, close: () => new Promise(resolve => server.close(resolve)) };
+  return { origin: `http://127.0.0.1:${server.address().port}`, videoBytes, videoSha, getMediaCalls: () => mediaCalls, getRefreshCalls: () => refreshCalls, close: () => new Promise(resolve => server.close(resolve)) };
 }
 
 test('standalone tactixcore-code CLI supports --version and studio commands from any directory', async t => {
@@ -125,7 +142,11 @@ test('standalone tactixcore-code CLI supports --version and studio commands from
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const outputs = [];
   assert.equal(await main(['--version'], { out: s => outputs.push(s), err: () => {} }), 0);
-  assert.match(outputs[0], /^tactixcore-code 0\.4\.1/);
+  assert.match(outputs[0], /^tactixcore-code 0\.5\.0/);
+
+  const helpOut = [];
+  assert.equal(await main(['--help'], { out: s => helpOut.push(s), err: () => {} }), 0);
+  assert.match(helpOut[0], /studio login\|status\|logout\|teams\|games\|.*--quiet/);
 
   const statusOut = [];
   assert.equal(await main(['studio', 'status', '--environment', 'dev'], {
@@ -320,4 +341,57 @@ test('multi-chunk video download (>10 chunks) cleans up WriteStream error listen
   assert.equal(mock.getMediaCalls(), 16);
   const maxListenerWarnings = warnings.filter(w => w.name === 'MaxListenersExceededWarning');
   assert.equal(maxListenerWarnings.length, 0);
+});
+
+test('ensureVideoFile retries transient 503 chunks, deduplicates concurrent OAuth refresh, and cleans orphan .part files', async t => {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-code-studio-resilience-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const mock = await startMockStudio({ failMediaFirstN: 2 });
+  t.after(mock.close);
+
+  const manager = new StudioDataManager(dir, {
+    async openBrowser(authUri) {
+      const r = await fetch(authUri, { redirect: 'manual' });
+      await fetch(r.headers.get('location'));
+    }
+  });
+  await manager.oauth.login({ environment: 'dev', origin: mock.origin });
+
+  // Concurrent refresh calls should coalesce into a single /auth/token request
+  const [r1, r2, r3] = await Promise.all([
+    manager.oauth.refresh(mock.origin),
+    manager.oauth.refresh(mock.origin),
+    manager.oauth.refresh(mock.origin)
+  ]);
+  assert.equal(mock.getRefreshCalls(), 1);
+  assert.equal(r1.access_token, r2.access_token);
+  assert.equal(r2.access_token, r3.access_token);
+
+  // Transient 503 errors on first 2 chunks should retry and succeed
+  const retryEvents = [];
+  const videoRes = await manager.ensureVideoFile({
+    environment: 'dev',
+    origin: mock.origin,
+    team_id: 'team_a',
+    game_id: 'm1',
+    video_id: 'v1',
+    retry_base_ms: 5,
+    max_retries: 3,
+    onProgress: ev => { if (ev.phase === 'retry') retryEvents.push(ev); }
+  });
+  assert.equal(videoRes.source, 'remote');
+  assert.equal(videoRes.sha256, mock.videoSha);
+  assert.equal(retryEvents.length, 2);
+
+  // Orphaned .part file should be cleaned up by studio clean
+  const orphanDir = join(dir, 'studio-cache', 'deadbeef0000', 'teams', 'team_a', 'm1', 'media');
+  mkdirSync(orphanDir, { recursive: true });
+  const orphanPart = join(orphanDir, 'aborted.mp4.123456.part');
+  writeFileSync(orphanPart, Buffer.alloc(1024, 0x42));
+  assert.equal(existsSync(orphanPart), true);
+
+  const cleanRes = manager.clean({ all: true });
+  assert.equal(existsSync(orphanPart), false);
+  assert.ok(cleanRes.removed_paths.some(p => p.endsWith('aborted.mp4.123456.part')));
 });

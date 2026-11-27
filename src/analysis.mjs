@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { realpathSync, statSync, readFileSync, mkdirSync, writeFileSync, accessSync, constants, createReadStream, readdirSync } from 'node:fs';
+import {
+  realpathSync, statSync, readFileSync, mkdirSync, writeFileSync, accessSync,
+  constants, createReadStream, readdirSync, existsSync, openSync, closeSync
+} from 'node:fs';
 import { resolve, join, relative, sep } from 'node:path';
 import { spawn } from 'node:child_process';
+import { profileDirectory } from './profile.mjs';
 import { Trace } from './telemetry.mjs';
 
 export const analysisSkills = {
@@ -17,6 +21,38 @@ function inside(root, candidate, kind) {
   const stat = statSync(path);
   if (kind === 'dir' ? !stat.isDirectory() : !stat.isFile()) throw new Error('Unexpected input type');
   return path;
+}
+
+function insideAny(roots, candidate, kind) {
+  if (typeof candidate !== 'string' || !candidate.trim()) throw new Error('Invalid input path');
+  for (const base of roots) {
+    let path;
+    try {
+      path = realpathSync(resolve(base, candidate));
+    } catch {
+      continue;
+    }
+    const rel = relative(base, path);
+    if (!rel || rel === '..' || rel.startsWith('..' + sep)) continue;
+    const stat = statSync(path);
+    if (kind === 'dir' ? !stat.isDirectory() : !stat.isFile()) throw new Error('Unexpected input type');
+    return path;
+  }
+  throw new Error('Path outside playground and studio-cache');
+}
+
+function resolveAllowedInputRoots(playgroundRoot, { env = process.env, studioCacheDir } = {}) {
+  const roots = [playgroundRoot];
+  const candidateCache = studioCacheDir || (env ? join(profileDirectory(env), 'studio-cache') : null);
+  if (candidateCache && existsSync(candidateCache)) {
+    try {
+      const realCache = realpathSync(candidateCache);
+      if (statSync(realCache).isDirectory() && !roots.includes(realCache)) {
+        roots.push(realCache);
+      }
+    } catch { /* ignore inaccessible cache root */ }
+  }
+  return roots;
 }
 
 function label(value) {
@@ -38,8 +74,8 @@ function loadJson(path, max = 4 * 1024 * 1024) {
   return { data: JSON.parse(bytes.toString('utf8')), sha256: createHash('sha256').update(bytes).digest('hex') };
 }
 
-function playerClips(data, root, scope) {
-  const comments = inside(root, data.comments, 'file');
+function playerClips(data, inputRoots, scope) {
+  const comments = insideAny(inputRoots, data.comments, 'file');
   const source = loadJson(comments).data;
   if (source.team_id !== scope.team || source.game_id !== scope.game
     || source.video_id !== id(data.video_id) || data.player_id !== id(scope.player)) {
@@ -66,9 +102,10 @@ export function planAnalysis(skill, options) {
   if (!Object.hasOwn(analysisSkills, skill)) throw new Error('Unknown analysis skill');
   const [dir, module] = analysisSkills[skill];
   const root = realpathSync(options.playground);
+  const inputRoots = resolveAllowedInputRoots(root, { env: options.env, studioCacheDir: options.studioCacheDir });
   const team = id(options.team);
   const game = id(options.game);
-  const { data, sha256 } = loadJson(inside(root, options.input, 'file'));
+  const { data, sha256 } = loadJson(insideAny(inputRoots, options.input, 'file'));
   if (data.schema !== 1 || data.team_id !== team || data.game_id !== game || data.skill !== skill) {
     throw new Error('Manifest scope mismatch');
   }
@@ -90,8 +127,8 @@ export function planAnalysis(skill, options) {
   if (skill === 'soccer-ownteam') {
     const version = 'v001';
     args.push('--team-id', team, '--team-name', label(data.team_name), '--match-id', game,
-      '--items', inside(root, data.items, 'dir'), '--videos', inside(root, data.videos, 'file'),
-      '--detections', inside(root, data.detections, 'file'), '--keypoints', inside(root, data.keypoints, 'file'),
+      '--items', insideAny(inputRoots, data.items, 'dir'), '--videos', insideAny(inputRoots, data.videos, 'file'),
+      '--detections', insideAny(inputRoots, data.detections, 'file'), '--keypoints', insideAny(inputRoots, data.keypoints, 'file'),
       '--output-root', output, '--keep-versions', '0', '--version', version);
     artifact = join(output, `${game}_${version}`, 'report.html');
     evidence = join(output, `${game}_${version}`, 'evidence.json');
@@ -105,19 +142,19 @@ export function planAnalysis(skill, options) {
     }
     args.push('run', '--own-team', label(data.team_name), '--opponent', label(data.opponent),
       '--competition', label(data.competition), '--as-of', data.as_of, '--game-id', game,
-      '--video-items', inside(root, data.items, 'dir'), '--own-formation', data.formation,
+      '--video-items', insideAny(inputRoots, data.items, 'dir'), '--own-formation', data.formation,
       '--video-match-opponent', label(data.video_match_opponent),
       '--video-annotated-team', data.video_annotated_team,
       '--video-coverage-note', label(data.video_coverage_note),
-      ...data.video_files.flatMap(path => ['--video-file', inside(root, path, 'file')]),
+      ...data.video_files.flatMap(path => ['--video-file', insideAny(inputRoots, path, 'file')]),
       '--output', output, '--keep-versions', '0');
-    if (data.source_registry) args.push('--source-registry', inside(root, data.source_registry, 'file'));
+    if (data.source_registry) args.push('--source-registry', insideAny(inputRoots, data.source_registry, 'file'));
     artifact = join(output, 'report.html');
     evidence = join(output, 'analysis.json');
   } else {
-    const { comments, indices } = playerClips(data, root, { team, game, player: options.player });
-    args.push('run', '--video', inside(root, data.video, 'file'), '--comments', comments,
-      '--tracks-dir', inside(root, data.tracks_dir, 'dir'), '--output', output,
+    const { comments, indices } = playerClips(data, inputRoots, { team, game, player: options.player });
+    args.push('run', '--video', insideAny(inputRoots, data.video, 'file'), '--comments', comments,
+      '--tracks-dir', insideAny(inputRoots, data.tracks_dir, 'dir'), '--output', output,
       '--no-baseline', ...indices.flatMap(index => ['--clip', String(index)]));
     artifact = join(output, 'index.html');
     evidence = join(output, 'manifest.json');
@@ -136,8 +173,16 @@ function startEngine(plan, env, traceparent, signal) {
   const pythonpath = [join(plan.engine, 'src'), plan.engine, join(plan.root, 'dataset_collector', 'common', 'src')].join(':');
   return new Promise((done, fail) => {
     const startedAt = Date.now();
+    const logFd = plan.logPath ? openSync(plan.logPath, 'w', 0o600) : null;
+    let logClosed = false;
+    const closeLog = () => {
+      if (logFd !== null && !logClosed) {
+        logClosed = true;
+        try { closeSync(logFd); } catch { /* ignore */ }
+      }
+    };
     const child = spawn(plan.python, plan.args, {
-      cwd: plan.root, stdio: 'ignore', signal, env: {
+      cwd: plan.root, stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore', signal, env: {
         ...engineEnv, PYTHONPATH: pythonpath, TRACEPARENT: traceparent, PYTHONDONTWRITEBYTECODE: '1'
       }
     });
@@ -147,6 +192,7 @@ function startEngine(plan, env, traceparent, signal) {
     }, 5_000) : null;
     heartbeat?.unref?.();
     const clear = () => {
+      closeLog();
       if (heartbeat) {
         clearInterval(heartbeat);
         if (process.stderr?.isTTY) process.stderr.write('\r\x1b[2K');
@@ -191,15 +237,16 @@ export async function executeAnalysis(plan, {
   try {
     const output = allocateGeneration(plan);
     const native = join(output, 'engine');
+    const logPath = join(output, 'engine.log');
     const outputIndex = plan.args.findIndex(arg => arg === '--output-root' || arg === '--output') + 1;
     const args = [...plan.args];
     args[outputIndex] = native;
-    plan = { ...plan, output, args,
+    plan = { ...plan, output, args, logPath,
       artifact: join(native, relative(':native-output:', plan.artifact)),
       evidence: join(native, relative(':native-output:', plan.evidence))
     };
     const code = await start(plan, env, tool.traceparent, signal);
-    if (code !== 0) throw new Error('Engine process failed');
+    if (code !== 0) throw new Error(`Engine process failed (exit code ${code})`);
     // Some opponent profiles publish the native enemy-report.html name.
     let report = plan.artifact;
     if (plan.skill === 'soccer-opponent') {
@@ -225,9 +272,11 @@ export async function executeAnalysis(plan, {
     }) + '\n', { mode: 0o600, flag: 'wx' });
     out(JSON.stringify({ ...result, directory: plan.output }));
     return 0;
-  } catch {
+  } catch (cause) {
     error = 'analysis_failed';
-    err(`Analysis failed or did not produce a verified report. Run ID: ${plan.runId}`);
+    const detail = cause?.message ? ` (${cause.message})` : '';
+    const logHint = plan.logPath ? ` Log: ${plan.logPath}` : '';
+    err(`Analysis failed or did not produce a verified report${detail}. Run ID: ${plan.runId}.${logHint}`);
     return 1;
   } finally {
     tool.end({}, error);

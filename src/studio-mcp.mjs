@@ -26,6 +26,38 @@ const DEFAULT_PROFILES = {
 const DEFAULT_SCOPES = ['workspace:read'];
 const MCP_PATH = '/mcp/studio/';
 const MCP_PROTOCOL_VERSION = '2025-03-26';
+const PKG_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function isRetryableFetchError(error) {
+  if (!error) return false;
+  if (error.name === 'TimeoutError') return true;
+  if (error.name === 'AbortError') return false;
+  if (error.retryable === true) return true;
+  if (error instanceof TypeError) return true;
+  return /fetch failed|network|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR/i.test(String(error.message || ''));
+}
+
+function sleepWithSignal(ms, signal) {
+  return new Promise((resolveSleep, rejectSleep) => {
+    if (signal?.aborted) return rejectSleep(signal.reason || new Error('Aborted'));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolveSleep();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      rejectSleep(signal.reason || new Error('Aborted'));
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+}
 
 function b64url(buffer) {
   return Buffer.from(buffer).toString('base64url');
@@ -312,6 +344,7 @@ export class StudioOAuthClient {
     this.fetchImpl = fetchImpl;
     this.openBrowser = openBrowser;
     this.store = store || new StudioOAuthStore(this.profileDir);
+    this.refreshInFlight = new Map();
   }
 
   status({ environment = 'dev', origin } = {}) {
@@ -470,44 +503,55 @@ export class StudioOAuthClient {
   }
 
   async refresh(origin) {
-    const session = this.store.get(origin);
-    if (!session?.refresh_token || !session?.device_id || !session?.device) {
-      throw new Error('Studio OAuth session not found. Run /studio login or tactixcore-code studio login.');
+    if (this.refreshInFlight.has(origin)) {
+      return this.refreshInFlight.get(origin);
     }
-    const tokenUrl = `${origin}/auth/token`;
-    const proof = createDpopProof(session.device, 'POST', tokenUrl);
-    const form = new URLSearchParams({
-      grant_type: 'refresh_token',
-      device_id: session.device_id,
-      refresh_token: session.refresh_token
-    });
-    const res = await this.fetchImpl(tokenUrl, {
-      method: 'POST',
-      redirect: 'error',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        DPoP: proof
-      },
-      body: form.toString()
-    });
-    if (!res.ok) {
-      if (res.status === 401 || res.status === 403) {
-        this.store.delete(origin);
-        throw new Error('Studio OAuth refresh token expired or revoked. Run /studio login again.');
+    const promise = (async () => {
+      const session = this.store.get(origin);
+      if (!session?.refresh_token || !session?.device_id || !session?.device) {
+        throw new Error('Studio OAuth session not found. Run /studio login or tactixcore-code studio login.');
       }
-      throw new Error(`Studio OAuth token refresh failed (HTTP ${res.status})`);
+      const tokenUrl = `${origin}/auth/token`;
+      const proof = createDpopProof(session.device, 'POST', tokenUrl);
+      const form = new URLSearchParams({
+        grant_type: 'refresh_token',
+        device_id: session.device_id,
+        refresh_token: session.refresh_token
+      });
+      const res = await this.fetchImpl(tokenUrl, {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          DPoP: proof
+        },
+        body: form.toString()
+      });
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          this.store.delete(origin);
+          throw new Error('Studio OAuth refresh token expired or revoked. Run /studio login again.');
+        }
+        throw new Error(`Studio OAuth token refresh failed (HTTP ${res.status})`);
+      }
+      const tokenData = await res.json();
+      const now = Date.now();
+      const updated = {
+        ...session,
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token || session.refresh_token,
+        scopes: tokenData.scope ? String(tokenData.scope).split(/\s+/).filter(Boolean) : session.scopes,
+        expires_at: now + Math.max(60, Number(tokenData.expires_in || 900)) * 1000
+      };
+      this.store.set(origin, updated);
+      return updated;
+    })();
+    this.refreshInFlight.set(origin, promise);
+    try {
+      return await promise;
+    } finally {
+      this.refreshInFlight.delete(origin);
     }
-    const tokenData = await res.json();
-    const now = Date.now();
-    const updated = {
-      ...session,
-      access_token: tokenData.access_token,
-      refresh_token: tokenData.refresh_token || session.refresh_token,
-      scopes: tokenData.scope ? String(tokenData.scope).split(/\s+/).filter(Boolean) : session.scopes,
-      expires_at: now + Math.max(60, Number(tokenData.expires_in || 900)) * 1000
-    };
-    this.store.set(origin, updated);
-    return updated;
   }
 
   async logout({ environment = 'dev', origin } = {}) {
@@ -590,7 +634,7 @@ export class StudioMCPClient {
     await this._rpc(origin, 'initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'tactixcore-code', version: '0.2.0' }
+      clientInfo: { name: 'tactixcore-code', version: PKG_VERSION }
     }, { signal });
     await this.oauth.authorizedFetch(origin, MCP_PATH, {
       method: 'POST',
@@ -862,7 +906,11 @@ export class StudioDataManager {
     };
   }
 
-  async ensureVideoFile({ environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, asset_id, force_refresh = false, verify_hash = true, signal, onProgress = null, videoIndex = null, videoTotal = null } = {}) {
+  async ensureVideoFile({
+    environment = 'dev', origin, team_id, game_id, workspace_id, account_id, video_id, asset_id,
+    force_refresh = false, verify_hash = true, signal, onProgress = null, videoIndex = null, videoTotal = null,
+    chunk_timeout_ms = 60_000, max_retries = 4, retry_base_ms = 500
+  } = {}) {
     const resolvedOrigin = resolveStudioOrigin({ environment, origin });
     const gid = game_id || workspace_id;
     safeId(team_id, 'team_id');
@@ -918,21 +966,57 @@ export class StudioDataManager {
       bytesPerSec: 0, etaSec: null, filename: displayName, done: false
     });
 
+    const cleanupPart = () => {
+      try { unlinkSync(partPath); } catch { /* ignore */ }
+    };
+    const onTerminate = sig => {
+      cleanupPart();
+      process.exit(sig === 'SIGINT' ? 130 : 143);
+    };
+    process.on('SIGINT', onTerminate);
+    process.on('SIGTERM', onTerminate);
+
     try {
       const writer = createWriteStream(partPath, { mode: 0o600 });
       try {
         while (written < info.size_bytes) {
           const end = Math.min(info.size_bytes - 1, written + chunkBytes - 1);
-          const res = await this.oauth.authorizedFetch(resolvedOrigin, info.download_path, {
-            method: 'GET',
-            headers: { Range: `bytes=${written}-${end}` },
-            signal
-          });
-          if (res.status !== 206 && res.status !== 200) {
-            throw new Error(`Video download failed (HTTP ${res.status})`);
+          let chunk = null;
+          let status = 206;
+          for (let attempt = 0; attempt <= max_retries; attempt++) {
+            try {
+              const timeoutSignal = AbortSignal.timeout(Math.max(1000, Number(chunk_timeout_ms)));
+              const reqSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+              const res = await this.oauth.authorizedFetch(resolvedOrigin, info.download_path, {
+                method: 'GET',
+                headers: { Range: `bytes=${written}-${end}` },
+                signal: reqSignal
+              });
+              if (res.status !== 206 && res.status !== 200) {
+                const err = new Error(`Video download failed (HTTP ${res.status})`);
+                if (RETRYABLE_HTTP_STATUSES.has(res.status)) err.retryable = true;
+                throw err;
+              }
+              status = res.status;
+              chunk = Buffer.from(await res.arrayBuffer());
+              if (chunk.length === 0) {
+                const err = new Error('Video download stream ended unexpectedly');
+                err.retryable = true;
+                throw err;
+              }
+              break;
+            } catch (err) {
+              if (signal?.aborted || attempt >= max_retries || !isRetryableFetchError(err)) {
+                throw err;
+              }
+              const backoffMs = Math.min(10_000, retry_base_ms * (2 ** attempt));
+              onProgress?.({
+                phase: 'retry',
+                message: `チャンク取得リトライ (${attempt + 1}/${max_retries}, ${formatBytes(written)}/${formatBytes(info.size_bytes)}): ${err.message}`
+              });
+              await sleepWithSignal(backoffMs, signal);
+            }
           }
-          const chunk = Buffer.from(await res.arrayBuffer());
-          if (chunk.length === 0) throw new Error('Video download stream ended unexpectedly');
           hasher.update(chunk);
           written += chunk.length;
           if (!writer.write(chunk)) {
@@ -957,7 +1041,7 @@ export class StudioDataManager {
             phase: 'download', prefix, completed: written, total: info.size_bytes,
             bytesPerSec, etaSec, filename: displayName, done: false
           });
-          if (res.status === 200) break;
+          if (status === 200) break;
         }
       } finally {
         if (!writer.destroyed && !writer.errored) {
@@ -977,7 +1061,7 @@ export class StudioDataManager {
       }
       const actualHash = hasher.digest('hex');
       if (written !== info.size_bytes) throw new Error(`Video size mismatch: expected=${info.size_bytes}, actual=${written}`);
-      if (actualHash !== info.sha256) throw new Error(`Video SHA-256 mismatch: expected=${info.sha256}, actual=${actualHash}`);
+      if (info.sha256 && actualHash !== info.sha256) throw new Error(`Video SHA-256 mismatch: expected=${info.sha256}, actual=${actualHash}`);
       renameSync(partPath, filePath);
       const totalElapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
       onProgress?.({
@@ -985,8 +1069,11 @@ export class StudioDataManager {
         bytesPerSec: written / totalElapsedSec, etaSec: 0, filename: displayName, done: true
       });
     } catch (error) {
-      try { unlinkSync(partPath); } catch { /* ignore */ }
+      cleanupPart();
       throw error;
+    } finally {
+      process.off('SIGINT', onTerminate);
+      process.off('SIGTERM', onTerminate);
     }
 
     const now = new Date().toISOString();
@@ -1134,6 +1221,37 @@ export class StudioDataManager {
     }
     if (!dry_run && toRemove.size > 0) this._writeIndex(index);
 
+    // Also clean up orphaned *.part / *.tmp staging files left behind by interrupted downloads
+    if (existsSync(this.cacheDir) && (all || videos_only || team_id || gid || max_age_hours !== undefined || max_bytes !== undefined)) {
+      const indexedPaths = new Set(Object.values(index.entries).map(e => resolve(e.path)));
+      const walkOrphans = dir => {
+        for (const item of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, item.name);
+          if (item.isDirectory()) {
+            walkOrphans(full);
+            continue;
+          }
+          if (!item.isFile()) continue;
+          if (!item.name.endsWith('.part') && !item.name.endsWith('.tmp')) continue;
+          if (indexedPaths.has(resolve(full))) continue;
+          const rel = relative(this.cacheDir, full).split(/[\\/]/);
+          // Expected layout: <originHash>/teams/<team_id>/<game_id>/<kind>/<file>
+          if (team_id && rel[2] !== team_id) continue;
+          if (gid && rel[3] !== gid) continue;
+          if (videos_only && rel[4] !== 'media') continue;
+          const safeTarget = inside(this.cacheDir, full);
+          const size = lstatSync(safeTarget).size;
+          reclaimedBytes += size;
+          removedPaths.push(safeTarget);
+          if (!dry_run) {
+            rmSync(safeTarget, { force: true });
+            removeEmptyParents(dirname(safeTarget), this.cacheDir);
+          }
+        }
+      };
+      walkOrphans(this.cacheDir);
+    }
+
     const remainingEntries = Object.values(index.entries).filter(e => !(dry_run && toRemove.has(e.key)));
     const remainingBytes = remainingEntries.reduce((sum, e) => sum + (this._isPresentFile(e.path) ? lstatSync(e.path).size : 0), 0);
     return {
@@ -1214,7 +1332,15 @@ export function studioExtension(manager) {
           }
           if (sub === 'login') {
             ctx.ui.notify(`Opening browser for Studio OAuth (${env})...`, 'info');
-            const st = await manager.login({ environment: env });
+            const onProgress = event => {
+              ctx.ui.setStatus?.('studio', formatProgressLine(event));
+            };
+            let st;
+            try {
+              st = await manager.login({ environment: env, onProgress });
+            } finally {
+              ctx.ui.setStatus?.('studio', '');
+            }
             ctx.ui.notify(`Studio OAuth connected: ${st.origin}`, 'info');
             return;
           }
