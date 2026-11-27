@@ -93,9 +93,9 @@ async function startMockStudio() {
         const { name, arguments: args } = rpc.params;
         let data;
         if (name === 'list_workspaces') data = { workspaces: [{ id: 'm1', owner_team_id: 'team_a', name: 'Match 1' }], count: 1 };
-        if (name === 'get_video_metadata') data = { team_id: args.team_id, workspace_id: args.workspace_id, count: 1, videos: [{ id: 'v1', asset_id: 'a1', filename: 'clip.mp4', sha256: videoSha, size_bytes: videoBytes.length, download_path: `/api/studio/v1/workspaces/${args.team_id}/${args.workspace_id}/media/a1` }] };
-        if (name === 'get_transition_annotations') data = { team_id: args.team_id, workspace_id: args.workspace_id, content_revision: 2, count: 1, items: [{ id: 'tr1', video: { id: 'v1' }, segment: { start_sec: 1, end_sec: 5 } }] };
-        if (name === 'get_video_download_info') data = { team_id: args.team_id, workspace_id: args.workspace_id, video_id: 'v1', asset_id: 'a1', filename: 'clip.mp4', sha256: videoSha, size_bytes: videoBytes.length, download_path: `/api/studio/v1/workspaces/${args.team_id}/${args.workspace_id}/media/a1`, chunk_bytes: 20000 };
+        if (name === 'get_video_metadata') data = { team_id: args.team_id, game_id: args.game_id, workspace_id: args.game_id, count: 1, videos: [{ id: 'v1', asset_id: 'a1', filename: 'clip.mp4', sha256: videoSha, size_bytes: videoBytes.length, download_path: `/api/studio/v1/workspaces/${args.team_id}/${args.game_id}/media/a1` }] };
+        if (name === 'get_transition_annotations') data = { team_id: args.team_id, game_id: args.game_id, workspace_id: args.game_id, content_revision: 2, count: 1, items: [{ id: 'tr1', video: { id: 'v1' }, segment: { start_sec: 1, end_sec: 5 } }] };
+        if (name === 'get_video_download_info') data = { team_id: args.team_id, game_id: args.game_id, workspace_id: args.game_id, video_id: 'v1', asset_id: 'a1', filename: 'clip.mp4', sha256: videoSha, size_bytes: videoBytes.length, download_path: `/api/studio/v1/workspaces/${args.team_id}/${args.game_id}/media/a1`, chunk_bytes: 20000 };
         return json(200, { jsonrpc: '2.0', id: rpc.id, result: { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data, isError: false } });
       }
     }
@@ -120,7 +120,7 @@ test('standalone tactixcore-code CLI supports --version and studio commands from
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const outputs = [];
   assert.equal(await main(['--version'], { out: s => outputs.push(s), err: () => {} }), 0);
-  assert.match(outputs[0], /^tactixcore-code 0\.2\.0/);
+  assert.match(outputs[0], /^tactixcore-code 0\.3\.0/);
 
   const statusOut = [];
   assert.equal(await main(['studio', 'status', '--environment', 'dev'], {
