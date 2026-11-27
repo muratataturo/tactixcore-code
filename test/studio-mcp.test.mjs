@@ -7,8 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../src/cli.mjs';
 import {
-  createStudioTool, createTerminalProgressReporter, formatBytes, formatDuration,
-  formatProgressLine, renderProgressBar, StudioDataManager, studioExtension
+  createStudioTool, createTerminalProgressReporter, DEFAULT_CACHE_POLICY, formatBytes, formatDuration,
+  formatProgressLine, manageCacheCleanSchedule, renderProgressBar, StudioDataManager, studioExtension
 } from '../src/studio-mcp.mjs';
 
 function verifyDpop(proof, method, expectedUrl, expectedJwk, expectedToken = null) {
@@ -142,7 +142,7 @@ test('standalone tactixcore-code CLI supports --version and studio commands from
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const outputs = [];
   assert.equal(await main(['--version'], { out: s => outputs.push(s), err: () => {} }), 0);
-  assert.match(outputs[0], /^tactixcore-code 0\.5\.0/);
+  assert.match(outputs[0], /^tactixcore-code 0\.6\.0/);
 
   const helpOut = [];
   assert.equal(await main(['--help'], { out: s => helpOut.push(s), err: () => {} }), 0);
@@ -394,4 +394,77 @@ test('ensureVideoFile retries transient 503 chunks, deduplicates concurrent OAut
   const cleanRes = manager.clean({ all: true });
   assert.equal(existsSync(orphanPart), false);
   assert.ok(cleanRes.removed_paths.some(p => p.endsWith('aborted.mp4.123456.part')));
+});
+
+test('cache policy auto-prunes older games on fetch while protecting current game, and manages launchd plist', async t => {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-code-studio-policy-'));
+  const launchDir = mkdtempSync(join(tmpdir(), 'tc-code-launchagents-'));
+  t.after(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(launchDir, { recursive: true, force: true });
+  });
+  const mock = await startMockStudio();
+  t.after(mock.close);
+
+  const manager = new StudioDataManager(dir, {
+    async openBrowser(authUri) {
+      const r = await fetch(authUri, { redirect: 'manual' });
+      await fetch(r.headers.get('location'));
+    }
+  });
+  assert.equal(manager.getCachePolicy().max_bytes, DEFAULT_CACHE_POLICY.max_bytes);
+  assert.equal(manager.getCachePolicy().enabled, true);
+
+  // Set a tight policy (50 KiB) so the newly downloaded ~42.5 KiB video stays, while an older 30 KiB entry is evicted
+  const savedPolicy = manager.setCachePolicy({ max_bytes: 50 * 1024, max_age_hours: 24 * 14, enabled: true });
+  assert.equal(savedPolicy.max_bytes, 50 * 1024);
+
+  // Seed an older cached game video
+  const oldPath = join(dir, 'studio-cache', 'older0000000', 'teams', 'team_a', 'old_game', 'media', 'old.mp4');
+  mkdirSync(join(dir, 'studio-cache', 'older0000000', 'teams', 'team_a', 'old_game', 'media'), { recursive: true });
+  writeFileSync(oldPath, Buffer.alloc(30 * 1024, 0x55));
+  const idx = manager._readIndex();
+  idx.entries['older0000000:team_a:old_game:video_file:old'] = {
+    key: 'older0000000:team_a:old_game:video_file:old',
+    origin: mock.origin,
+    team_id: 'team_a',
+    game_id: 'old_game',
+    workspace_id: 'old_game',
+    kind: 'video_file',
+    video_id: 'v_old',
+    asset_id: 'old',
+    path: oldPath,
+    sha256: '0'.repeat(64),
+    size_bytes: 30 * 1024,
+    fetched_at: '2026-01-01T00:00:00.000Z',
+    last_accessed_at: '2026-01-01T00:00:00.000Z'
+  };
+  manager._writeIndex(idx);
+
+  await manager.oauth.login({ environment: 'dev', origin: mock.origin });
+  const pruneEvents = [];
+  const fetched = await manager.ensureVideoFile({
+    environment: 'dev',
+    origin: mock.origin,
+    team_id: 'team_a',
+    game_id: 'm1',
+    video_id: 'v1',
+    onProgress: ev => { if (ev.phase === 'cache_prune') pruneEvents.push(ev); }
+  });
+  assert.equal(existsSync(fetched.path), true);
+  assert.equal(existsSync(oldPath), false);
+  assert.equal(pruneEvents.length, 1);
+
+  // Schedule install / status / uninstall (without calling system launchctl in test)
+  const installed = manageCacheCleanSchedule('install', { profileDir: dir, launchAgentsDir: launchDir, hour: 3, runLaunchctl: false });
+  assert.equal(installed.installed, true);
+  assert.equal(installed.schedule, 'daily 03:00');
+  const plistText = readFileSync(installed.plist_path, 'utf8');
+  assert.match(plistText, /com\.tactixcore\.code\.studio-cache-clean/);
+  assert.match(plistText, /--policy/);
+  assert.equal(manageCacheCleanSchedule('status', { profileDir: dir, launchAgentsDir: launchDir, runLaunchctl: false }).installed, true);
+  const uninstalled = manageCacheCleanSchedule('uninstall', { profileDir: dir, launchAgentsDir: launchDir, runLaunchctl: false });
+  assert.equal(uninstalled.installed, false);
+  assert.equal(existsSync(installed.plist_path), false);
 });
