@@ -10,7 +10,7 @@ const help = `Usage
   tactixcore-code configure --env-file PATH
   tactixcore-code doctor [--env-file PATH]
   tactixcore-code check-openrouter [--env-file PATH]
-  tactixcore-code studio login|status|logout|workspaces|videos|annotations|fetch|cache|clean [--environment dev|prd]
+  tactixcore-code studio login|status|logout|teams|games|videos|annotations|results|fetch|cache|clean [--environment dev|prd] [--quiet]
   tactixcore-code pi --prompt TEXT [--skill SKILL] [--env-file PATH] [--model MODEL]
   tactixcore-code pi --prompt TEXT --skill SKILL --playground PATH --team ID --game ID --analysis-input FILE
   tactixcore-code skills list
@@ -198,7 +198,7 @@ export async function main(args, {
         const { planAnalysis } = await import('./analysis.mjs');
         analysis = planAnalysis(values.skill, {
           playground: values.playground ?? env.TACTIXCORE_PLAYGROUND, input: values['analysis-input'],
-          team: values.team, game: values.game, opponent: values.opponent, player: values.player
+          team: values.team, game: values.game, opponent: values.opponent, player: values.player, env
         });
       }
       return await runPi({

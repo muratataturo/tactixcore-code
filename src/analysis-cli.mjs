@@ -46,7 +46,7 @@ export async function runAnalysisCommand(command, args, { env, out, err }) {
   }
   try {
     const plan = planAnalysis(positionals[0], {
-      ...values, playground: values.playground ?? env.TACTIXCORE_PLAYGROUND
+      ...values, env, playground: values.playground ?? env.TACTIXCORE_PLAYGROUND
     });
     if (values['dry-run']) {
       out(JSON.stringify({
@@ -59,8 +59,9 @@ export async function runAnalysisCommand(command, args, { env, out, err }) {
     return await executeAnalysis(plan, {
       env, out, err, endpoint: values['otlp-endpoint'] ?? env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
     });
-  } catch {
-    err('Analysis inputs are invalid or unavailable. Check skill, scope, manifest, and Python environment.');
+  } catch (error) {
+    const detail = error?.message ? ` (${error.message})` : '';
+    err(`Analysis inputs are invalid or unavailable${detail}. Check skill, scope, manifest, and Python environment.`);
     return 1;
   }
 }
