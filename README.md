@@ -42,11 +42,14 @@ tactixcore-code --help
 
 ```sh
 tactixcore-code studio login --environment dev
-tactixcore-code studio workspaces --environment dev
-tactixcore-code studio fetch --environment dev --team TEAM_ID --workspace WORKSPACE_ID
+tactixcore-code studio teams --environment dev
+tactixcore-code studio games --environment dev --team TEAM_ID
+tactixcore-code studio fetch --environment dev --team TEAM_ID --game GAME_ID
 tactixcore-code studio cache
 tactixcore-code studio clean --videos-only
 ```
+
+`studio login` / `teams` / `games` / `fetch` は進捗（動画ダウンロードの進捗バー・速度・ETA、キャッシュ SHA-256 検証、ステップ経過、OAuth 待機残り時間）を `stderr` に表示し、`stdout` は機械可読な JSON のまま保ちます。進捗表示を抑止したい場合は `--quiet` を指定してください。
 
 ## Pi の対話画面を開く
 

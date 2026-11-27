@@ -135,13 +135,25 @@ function startEngine(plan, env, traceparent, signal) {
   const engineEnv = Object.fromEntries(allowed.filter(name => env[name]).map(name => [name, env[name]]));
   const pythonpath = [join(plan.engine, 'src'), plan.engine, join(plan.root, 'dataset_collector', 'common', 'src')].join(':');
   return new Promise((done, fail) => {
+    const startedAt = Date.now();
     const child = spawn(plan.python, plan.args, {
       cwd: plan.root, stdio: 'ignore', signal, env: {
         ...engineEnv, PYTHONPATH: pythonpath, TRACEPARENT: traceparent, PYTHONDONTWRITEBYTECODE: '1'
       }
     });
-    child.once('error', fail);
-    child.once('close', code => done(code));
+    const heartbeat = process.stderr?.isTTY ? setInterval(() => {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      process.stderr.write(`\r\x1b[2K[analysis] ${plan.skill} 実行中... (${elapsed}s経過)`);
+    }, 5_000) : null;
+    heartbeat?.unref?.();
+    const clear = () => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        if (process.stderr?.isTTY) process.stderr.write('\r\x1b[2K');
+      }
+    };
+    child.once('error', error => { clear(); fail(error); });
+    child.once('close', code => { clear(); done(code); });
   });
 }
 

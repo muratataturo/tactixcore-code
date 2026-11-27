@@ -116,7 +116,7 @@ export function dashboardExtension(ledger, activeWorkers = () => 0) {
     const updateToolActivity = () => {
       const names = [...tools.values()];
       if (names.includes('web_search')) motion.change('searching');
-      else if (names.includes('web_fetch')) motion.change('fetching');
+      else if (names.includes('web_fetch') || names.includes('studio_mcp')) motion.change('fetching');
       else if (names.length) motion.change('working');
       else motion.change(running ? 'thinking' : 'done');
     };
