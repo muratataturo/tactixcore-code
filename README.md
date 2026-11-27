@@ -11,15 +11,42 @@ npm ci --ignore-scripts
 node bin/tactixcore-code.mjs --help
 ```
 
-どのディレクトリからでも `tactixcore-code` で起動するには、同じリポジトリのルートで次を実行します。
+どのディレクトリからでも `tactixcore-code` で起動するには、同じリポジトリのルートで次を実行します。アップデート時も同じコマンドで最新版を再インストールできます。
 
 ```sh
 npm install --global --ignore-scripts --install-links .
 command -v tactixcore-code
+tactixcore-code --version
 tactixcore-code --help
 ```
 
 インストール後に zsh でコマンドが見つからない場合は、`rehash` を実行してから再確認します。まだ見つからない場合は、`npm prefix --global` が返すディレクトリの `bin` が PATH に含まれているか確認してください。
+
+## Studio MCP（OAuth 認証・動画・トランジション注釈取得とキャッシュ管理）
+
+任意のディレクトリから Studio API の MCP エンドポイントへ OAuth (PKCE + DPoP) で接続し、動画メタデータ・動画ファイル・トランジション注釈を取得できます。認証情報とキャッシュはユーザープロファイル（`~/.config/tactixcore-code/studio-auth.json`, `~/.config/tactixcore-code/studio-cache/`）に保存されるため、作業ディレクトリに依存しません。
+
+### Pi 会話セッション内での操作
+
+- **スラッシュコマンドで直接実行（LLM を経由せず即実行）**:
+  - `/studio login`（ブラウザで OAuth 認可を実行。本番は `/studio login prd`）
+  - `/studio status` / `/studio logout`
+  - `/studio workspaces`（認可済みワークスペース一覧）
+  - `/studio fetch <team_id> <workspace_id> [--no-video] [--refresh]`（動画メタデータ・注釈・動画を一括取得。キャッシュ済みなら再利用し、ローカルに無い場合は自動再取得）
+  - `/studio cache`（キャッシュ件数・容量確認）
+  - `/studio clean`（全キャッシュ削除） / `/studio clean --videos-only`（動画バイナリのみ削除しメタデータ・注釈は保持）
+- **自然言語で Pi に依頼（`studio_mcp` ツールを自動呼び出し）**:
+  - 例：「Studio のワークスペース一覧を見せて」「`team_id/workspace_id` のトランジション注釈と動画を取得して」「ローカルの動画キャッシュをクリーンして」
+
+### CLI から直接実行
+
+```sh
+tactixcore-code studio login --environment dev
+tactixcore-code studio workspaces --environment dev
+tactixcore-code studio fetch --environment dev --team TEAM_ID --workspace WORKSPACE_ID
+tactixcore-code studio cache
+tactixcore-code studio clean --videos-only
+```
 
 ## Pi の対話画面を開く
 

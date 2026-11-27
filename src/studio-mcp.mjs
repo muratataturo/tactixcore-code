@@ -909,7 +909,7 @@ export function createStudioTool(manager) {
 export function studioExtension(manager) {
   return pi => {
     pi.registerCommand('studio', {
-      description: 'Studio MCP OAuth & cache: /studio login|status|logout|workspaces|cache|clean [dev|prd] [--videos-only]',
+      description: 'Studio MCP OAuth & cache: /studio login|status|logout|workspaces|fetch|cache|clean [dev|prd] [--videos-only]',
       handler: async (args, ctx) => {
         const parts = String(args || '').trim().split(/\s+/).filter(Boolean);
         const sub = parts[0] || 'status';
@@ -937,6 +937,20 @@ export function studioExtension(manager) {
             ctx.ui.notify(`Workspaces (${res.count}): ${lines || 'none'}`, 'info');
             return;
           }
+          if (sub === 'fetch') {
+            const positional = parts.slice(1).filter(p => !p.startsWith('--') && p !== 'dev' && p !== 'prd');
+            const [team_id, workspace_id, video_id] = positional;
+            if (!team_id || !workspace_id) {
+              ctx.ui.notify('Usage: /studio fetch <team_id> <workspace_id> [video_id] [--no-video] [--refresh]', 'warning');
+              return;
+            }
+            const include_video = !parts.includes('--no-video');
+            const force_refresh = parts.includes('--refresh');
+            ctx.ui.notify(`Fetching Studio data (${team_id}/${workspace_id})...`, 'info');
+            const res = await manager.ensureMatchData({ environment: env, team_id, workspace_id, video_id, include_video, force_refresh });
+            ctx.ui.notify(`Fetched ${team_id}/${workspace_id}: metadata(${res.video_metadata.source}), annotations(${res.annotations.source}, ${res.annotations.count}件), videos(${res.videos.length}本)`, 'info');
+            return;
+          }
           if (sub === 'cache') {
             const st = manager.cacheStatus();
             ctx.ui.notify(`Studio cache: ${st.present_entries} present, ${st.missing_entries} missing, ${st.total_bytes} bytes (${st.cache_dir})`, 'info');
@@ -948,7 +962,7 @@ export function studioExtension(manager) {
             ctx.ui.notify(`Studio cache cleaned: removed ${res.removed_count} files (${res.reclaimed_bytes} bytes reclaimed).`, 'info');
             return;
           }
-          ctx.ui.notify('Usage: /studio login|status|logout|workspaces|cache|clean [dev|prd] [--videos-only]', 'warning');
+          ctx.ui.notify('Usage: /studio login|status|logout|workspaces|fetch|cache|clean [dev|prd] [--videos-only]', 'warning');
         } catch (error) {
           ctx.ui.notify(`Studio error: ${error.message}`, 'error');
         }
